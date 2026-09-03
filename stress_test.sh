@@ -53,6 +53,21 @@ get_cpu_model() {
     grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^[ \t]*//' || echo "未知 CPU"
 }
 
+# 读取设备序列号 (SN): 优先系统序列号, 回退主板/机箱序列号, 均无则 N/A
+get_serial_number() {
+    local sn=""
+    for key in system-serial-number baseboard-serial-number chassis-serial-number; do
+        sn=$(dmidecode -s "$key" 2>/dev/null | tr -d '\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        case "$sn" in
+            ""|"Not Specified"|"None"|"Unknown"|"To Be Filled By O.E.M."|"System Serial Number"|"Base Board Serial Number"|"Chassis Serial Number")
+                continue ;;
+            *)
+                echo "$sn"; return ;;
+        esac
+    done
+    echo "N/A"
+}
+
 show_header() {
     log "============================================================"
     log "  系统满负载压力测试 — ${ENGINE}"
@@ -61,6 +76,7 @@ show_header() {
     log "  内存: 压测 ~$(( STRESS_MEM_KB / 1024 / 1024 )) GB / 可用 $(( AVAIL_MEM_KB / 1024 / 1024 )) GB / 总 $(( TOTAL_MEM_KB / 1024 / 1024 )) GB (保留 4GB)"
     log "  内存 worker 数: ${VM_WORKERS} (动态计算)"
     log "  系统: $(cat /etc/redhat-release 2>/dev/null || echo '未知')"
+    log "  设备序列号: $(get_serial_number)"
     log "  持续时间: ${DURATION_SEC} 秒 ($(( DURATION_SEC / 3600 )) 小时)"
     log "  开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
     log "============================================================"

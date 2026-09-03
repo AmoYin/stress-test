@@ -165,7 +165,7 @@ ensure_stress_ng() {
 }
 
 install_deps() {
-    log "==> 检查/安装依赖 (stress-ng, sysstat, lm_sensors, ipmitool)..."
+    log "==> 检查/安装依赖 (stress-ng, sysstat, lm_sensors, ipmitool, dmidecode)..."
 
     # 离线优先: 同目录存在 rpms/ 离线包且依赖未满足时, 先离线安装
     local need_offline=0
@@ -173,6 +173,7 @@ install_deps() {
     command -v mpstat &>/dev/null || need_offline=1
     command -v sensors &>/dev/null || need_offline=1
     command -v ipmitool &>/dev/null || need_offline=1
+    command -v dmidecode &>/dev/null || need_offline=1
     if [ "$need_offline" -eq 1 ] && [ -d "${SCRIPT_DIR}/rpms" ] && ls "${SCRIPT_DIR}"/rpms/*.rpm &>/dev/null; then
         install_from_offline
     fi
@@ -183,9 +184,10 @@ install_deps() {
         log "安装 sysstat ..."
         dnf install -y sysstat || yum install -y sysstat || true
     fi
-    # 温度/功耗工具可选, 安装失败不阻断
+    # 温度/功耗/序列号工具可选, 安装失败不阻断
     command -v sensors &>/dev/null || { log "安装 lm_sensors ..."; dnf install -y lm_sensors || true; }
     command -v ipmitool &>/dev/null || { log "安装 ipmitool ..."; dnf install -y ipmitool || true; }
+    command -v dmidecode &>/dev/null || { log "安装 dmidecode ..."; dnf install -y dmidecode || true; }
 
     if command -v stress-ng &>/dev/null; then
         log "压测引擎: $(stress-ng --version 2>/dev/null | head -1)"
@@ -255,6 +257,12 @@ run_stress_and_monitor() {
         log "       若为参数问题, 请确认已使用最新版 stress_test.sh (含参数兼容探测)"
     fi
 
+    # 采样时间延长: 压测结束后继续采样压测时长的 10%, 观察系统恢复情况
+    local cooldown_sec=$(( DURATION_SEC / 10 ))
+    [ "$cooldown_sec" -lt 10 ] && cooldown_sec=10
+    log "压测结束, 继续采样 ${cooldown_sec} 秒 (压测时长的 10%), 观察系统恢复..."
+    sleep "$cooldown_sec"
+
     # 停止监控
     log "停止监控 (PID: ${MONITOR_PID})..."
     kill -TERM "${MONITOR_PID}" 2>/dev/null || true
@@ -270,11 +278,12 @@ run_stress_and_monitor() {
     fi
     log "监控数据: ${LATEST_CSV}"
 
-    # 生成报告
+    # 生成报告 (传入计划压测时长与压测退出码, 用于"系统未崩溃"验收判定)
     local ts=$(date +%Y%m%d_%H%M%S)
     local html="${REPORT_DIR}/stress_report_${ts}.html"
     log "生成报告: ${html}"
-    python3 "${SCRIPT_DIR}/generate_report.py" "${LATEST_CSV}" "${html}"
+    python3 "${SCRIPT_DIR}/generate_report.py" "${LATEST_CSV}" "${html}" \
+        --duration "${DURATION_SEC}" --rc "${STRESS_RC}"
 
     # 收集 stress-ng 汇总
     local stress_log=$(ls -t "${LOG_DIR}"/stress_*.log 2>/dev/null | grep -v monitor | head -1)

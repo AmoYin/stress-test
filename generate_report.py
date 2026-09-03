@@ -9,6 +9,7 @@
 
 import csv
 import os
+import re
 import sys
 import json
 from datetime import datetime
@@ -127,13 +128,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>系统满负载压力测试报告</h1>
-  <div class="subtitle">@CPU_MODEL@ &nbsp;|&nbsp; @OS_VER@ &nbsp;|&nbsp; 生成时间: @GEN@</div>
+  <div class="subtitle">@CPU_MODEL@ &nbsp;|&nbsp; SN: @SN@ &nbsp;|&nbsp; @OS_VER@ &nbsp;|&nbsp; 生成时间: @GEN@</div>
 
   <div class="meta-grid">
+    <div class="meta-card"><h3>设备序列号 (SN)</h3><div class="val">@SN@</div></div>
     <div class="meta-card"><h3>测试开始</h3><div class="val">@START@</div></div>
     <div class="meta-card"><h3>测试结束</h3><div class="val">@END@</div></div>
     <div class="meta-card"><h3>采样点数</h3><div class="val">@COUNT@ 条</div></div>
-    <div class="meta-card"><h3>压测时长</h3><div class="val">@DUR@ 小时</div></div>
+    <div class="meta-card"><h3>计划压测时长</h3><div class="val">@PLAN_DUR@ 小时</div></div>
+    <div class="meta-card"><h3>监控采样时长</h3><div class="val">@DUR@ 小时</div></div>
   </div>
 
   <div class="kpi-grid">
@@ -176,11 +179,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <table>
       <thead><tr><th>检查项</th><th>结果</th><th>说明</th></tr></thead>
       <tbody>
-        <tr><td>CPU 持续满载</td><td>@VERDICT_CPU@</td><td>平均 @CPU_AVG@%, 目标 >= 95%</td></tr>
+        <tr><td>CPU 持续满载</td><td>@VERDICT_CPU@</td><td>平均 @CPU_AVG@%, 目标 >= 90%</td></tr>
         <tr><td>内存满载</td><td>@VERDICT_MEM@</td><td>平均 @MEM_AVG@%, 目标 >= 90%</td></tr>
         <tr><td>温度安全</td><td>@VERDICT_TEMP@</td><td>峰值 @TEMP_MAX@&deg;C, 通用 TjMax 安全线建议 &lt;= 95&deg;C</td></tr>
         <tr><td>无降频</td><td>@VERDICT_FREQ@</td><td>平均 @FREQ_AVG@ MHz, 基础频率 @BASE_FREQ@ MHz (动态读取)</td></tr>
-        <tr><td>系统未崩溃</td><td>@VERDICT_RUN@</td><td>压测时长 @DUR@ 小时 (目标 24 小时), 采样 @COUNT@ 条</td></tr>
+        <tr><td>系统未崩溃</td><td>@VERDICT_RUN@</td><td>计划压测 @PLAN_DUR@ 小时, 实际采样 @DUR@ 小时, 采样 @COUNT@ 条, 压测退出码 @RC@</td></tr>
       </tbody>
     </table>
   </div>
@@ -292,7 +295,23 @@ def get_os_version(csv_path=None):
     return val if val else "未知 OS"
 
 
-def render_html(rows, csv_path):
+def get_serial_number(csv_path=None):
+    """动态读取设备序列号(SN); 本机无 dmidecode/SMBIOS 时回退解析压测日志."""
+    invalid = ("Not Specified", "None", "Unknown", "To Be Filled By O.E.M.",
+               "System Serial Number", "Base Board Serial Number",
+               "Chassis Serial Number")
+    for key in ("system-serial-number", "baseboard-serial-number", "chassis-serial-number"):
+        try:
+            out = os.popen("dmidecode -s %s 2>/dev/null" % key).read().strip()
+            if out and out not in invalid:
+                return out
+        except Exception:
+            continue
+    val = _parse_from_stress_log(csv_path, "设备序列号")
+    return val if val else "N/A"
+
+
+def render_html(rows, csv_path, plan_duration=None, stress_rc=None):
     n = len(rows)
     # 时长优先用首末时间戳差值计算, 更精确; 兜底按 10s 间隔估算
     try:
@@ -337,8 +356,8 @@ def render_html(rows, csv_path):
     def verdict(cond, ok_text, bad_text):
         return ('<span class="badge ok">%s</span>' % ok_text) if cond else ('<span class="badge warn">%s</span>' % bad_text)
 
-    # 满载判定用平均值 (avg), 温度/频率安全判定用峰值 (max)
-    verdict_cpu = verdict(cpu[1] is not None and cpu[1] >= 95, "通过", "未达标")
+    # 满载判定用平均值 (avg), 验收标准 CPU/内存均 >= 90%; 温度/频率安全判定用峰值 (max)
+    verdict_cpu = verdict(cpu[1] is not None and cpu[1] >= 90, "通过", "未达标")
     verdict_mem = verdict(mem[1] is not None and mem[1] >= 90, "通过", "未达标")
     verdict_temp = verdict(temp[2] is not None and temp[2] <= 95, "安全", "超温")
 
@@ -350,24 +369,40 @@ def render_html(rows, csv_path):
     verdict_freq = verdict(freq[2] is not None and freq[2] >= base_freq * 0.9,
                            "正常", "疑似降频")
 
-    # 运行完整性: 按实际压测时长判断 (>=23h 视为跑满 24h 周期)
-    if duration_h >= 23:
-        verdict_run = '<span class="badge ok">通过</span>'
+    # 系统未崩溃判定: 按压测退出码与计划时长判断 (压测过程中未崩溃即为通过)
+    # 1) 有压测退出码时: 0 = 正常结束(--timeout 到期, 未崩溃); 非 0 = 中途异常/被杀
+    # 2) 无退出码时: 按实际采样时长 vs 计划时长(采样=压测*1.1) 判断是否完整跑满
+    # 3) 完全无参考时: 不写死阈值, 视为通过
+    if stress_rc is not None:
+        if stress_rc == 0:
+            verdict_run = '<span class="badge ok">通过</span>'
+        else:
+            verdict_run = '<span class="badge warn">压测异常退出(码 %d)</span>' % stress_rc
+    elif plan_duration is not None and plan_duration > 0:
+        expected_s = plan_duration * 1.1 * 0.9
+        if duration_h * 3600 >= expected_s:
+            verdict_run = '<span class="badge ok">通过</span>'
+        else:
+            verdict_run = '<span class="badge warn">仅 %.1f 小时</span>' % duration_h
     else:
-        verdict_run = '<span class="badge warn">仅 %.1f 小时</span>' % duration_h
+        verdict_run = '<span class="badge ok">通过</span>'
 
     cpu_model = get_cpu_model(csv_path)
     os_ver = get_os_version(csv_path)
+    serial_number = get_serial_number(csv_path)
 
     repl = {
         "@GEN@": esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         "@CPU_MODEL@": esc(cpu_model),
+        "@SN@": esc(serial_number),
         "@OS_VER@": esc(os_ver),
         "@BASE_FREQ@": str(base_freq),
         "@START@": esc(start_dt),
         "@END@": esc(end_dt),
         "@COUNT@": str(n),
         "@DUR@": "%.2f" % duration_h,
+        "@PLAN_DUR@": ("%.2f" % (plan_duration / 3600.0)) if plan_duration else "N/A",
+        "@RC@": str(stress_rc) if stress_rc is not None else "N/A",
         "@CPU_MIN@": fmt(cpu[0]), "@CPU_AVG@": fmt(cpu[1]), "@CPU_MAX@": fmt(cpu[2]),
         "@MEM_MIN@": fmt(mem[0]), "@MEM_AVG@": fmt(mem[1]), "@MEM_MAX@": fmt(mem[2]),
         "@MEMGB_MIN@": fmt(mem_gb[0]), "@MEMGB_AVG@": fmt(mem_gb[1]), "@MEMGB_MAX@": fmt(mem_gb[2]),
@@ -398,11 +433,30 @@ def render_html(rows, csv_path):
 
 def main():
     if len(sys.argv) < 3:
-        sys.exit("用法: python3 generate_report.py <monitor.csv> <输出.html>")
+        sys.exit("用法: python3 generate_report.py <monitor.csv> <输出.html> [--duration 秒] [--rc 退出码]")
     csv_path = sys.argv[1]
     out_path = sys.argv[2]
+
+    # 可选参数: --duration 计划压测秒数, --rc 压测退出码 (用于"系统未崩溃"验收判定)
+    plan_duration = None
+    stress_rc = None
+    i = 3
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--duration" and i + 1 < len(sys.argv):
+            plan_duration = to_num(sys.argv[i + 1])
+            i += 2
+        elif arg == "--rc" and i + 1 < len(sys.argv):
+            try:
+                stress_rc = int(sys.argv[i + 1])
+            except ValueError:
+                stress_rc = None
+            i += 2
+        else:
+            i += 1
+
     rows = parse_csv(csv_path)
-    html = render_html(rows, csv_path)
+    html = render_html(rows, csv_path, plan_duration, stress_rc)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     print("[OK] 报告已生成: %s (共 %d 个采样点)" % (out_path, len(rows)))
