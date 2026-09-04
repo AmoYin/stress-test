@@ -106,41 +106,73 @@ install_from_offline() {
     local RPM_DIR="${SCRIPT_DIR}/rpms"
     [ -d "$RPM_DIR" ] || return 1
     # 排除 stress-ng RPM (默认走源码编译 0.20.01, 见 ensure_stress_ng)
-    local rpms=()
-    local f
+    # 分离"开发头文件"包 (glibc-devel/glibc-headers/libxcrypt-devel): 它们精确依赖同版本 glibc 主包,
+    # 若系统 glibc 版本不同会装不上, 但编译 stress-ng 用的头文件/链接脚本在 glibc 2.28 各小版本间
+    # ABI 兼容, 故用 --nodeps 兜底安装 (不动系统 glibc 主包, 避免升级风险)
+    local rpms=() dev_pkgs=() f
     for f in "${RPM_DIR}"/*.rpm; do
         case "$f" in
             *stress-ng*) continue ;;
         esac
-        rpms+=("$f")
+        case "$(basename "$f")" in
+            glibc-devel-*|glibc-headers-*|libxcrypt-devel-*)
+                dev_pkgs+=("$f") ;;
+            *)
+                rpms+=("$f") ;;
+        esac
     done
-    [ "${#rpms[@]}" -gt 0 ] || return 1
+    [ "${#rpms[@]}" -gt 0 ] || [ "${#dev_pkgs[@]}" -gt 0 ] || return 1
 
-    log "==> 检测到离线 RPM 包 (${#rpms[@]} 个, 已排除 stress-ng), 优先离线安装..."
+    log "==> 检测到离线 RPM 包 (常规 ${#rpms[@]} + 开发头 ${#dev_pkgs[@]} 个, 已排除 stress-ng), 优先离线安装..."
 
-    # 1) 优先 dnf/yum 本地安装 (自动解析依赖, 已装包自动跳过)
-    if command -v dnf &>/dev/null; then
-        if dnf install -y "${rpms[@]}" 2>/dev/null; then
-            log "离线安装完成 (dnf)"
-            return 0
+    local failed=0
+
+    # 1) 常规包: 优先 dnf/yum 本地批量安装 (自动解析依赖排序, 已装包自动跳过)
+    if [ "${#rpms[@]}" -gt 0 ]; then
+        if command -v dnf &>/dev/null; then
+            if dnf install -y "${rpms[@]}" 2>/dev/null; then
+                log "常规依赖离线安装完成 (dnf)"
+            else
+                log "[WARN] dnf 常规包安装未完全成功, 回退 rpm 逐个安装..."
+                failed=1
+            fi
+        elif command -v yum &>/dev/null; then
+            if yum install -y "${rpms[@]}" 2>/dev/null; then
+                log "常规依赖离线安装完成 (yum)"
+            else
+                log "[WARN] yum 常规包安装未完全成功, 回退 rpm 逐个安装..."
+                failed=1
+            fi
+        else
+            failed=1
         fi
-        log "[WARN] dnf 离线安装失败, 回退 rpm 直接安装..."
-    elif command -v yum &>/dev/null; then
-        if yum install -y "${rpms[@]}" 2>/dev/null; then
-            log "离线安装完成 (yum)"
-            return 0
-        fi
-        log "[WARN] yum 离线安装失败, 回退 rpm 直接安装..."
     fi
 
-    # 2) 回退 rpm: 逐个安装, 跳过已装包; 依赖包字母序先于主包, 顺序安全
-    local failed=0
-    local f pkgname
-    for f in "${rpms[@]}"; do
+    # 2) 常规包 rpm 回退: 多轮循环处理依赖顺序 (每轮装上一轮满足依赖的包), 跳过已装
+    if [ "$failed" -eq 1 ] && [ "${#rpms[@]}" -gt 0 ]; then
+        local progress=1 pkgname
+        while [ "$progress" -eq 1 ]; do
+            progress=0
+            for f in "${rpms[@]}"; do
+                pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null)
+                rpm -q "$pkgname" &>/dev/null && continue
+                if rpm -Uvh "$f" 2>/dev/null; then
+                    log "  已安装: $(basename "$f")"
+                    progress=1
+                fi
+            done
+        done
+    fi
+
+    # 3) 开发头文件包: 先正常装, 失败用 --nodeps (跳过 glibc 主包精确版本匹配)
+    local pkgname
+    for f in "${dev_pkgs[@]}"; do
         pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null)
         rpm -q "$pkgname" &>/dev/null && continue
         if rpm -Uvh "$f" 2>/dev/null; then
             log "  已安装: $(basename "$f")"
+        elif rpm -Uvh --nodeps "$f" 2>/dev/null; then
+            log "  已安装(跳过 glibc 版本匹配): $(basename "$f")"
         else
             log "[WARN] 安装失败: $(basename "$f")"
             failed=1
@@ -250,10 +282,13 @@ ensure_stress_ng() {
 }
 
 install_deps() {
-    log "==> 检查/安装依赖 (stress-ng, sysstat, lm_sensors, ipmitool, dmidecode)..."
+    log "==> 检查/安装依赖 (gcc, make, stress-ng, sysstat, lm_sensors, ipmitool, dmidecode)..."
 
     # 离线优先: 同目录存在 rpms/ 离线包且依赖未满足时, 先离线安装
+    # 注意: gcc/make 是源码编译 stress-ng 0.20.01 的前置条件, 必须纳入检查
     local need_offline=0
+    command -v gcc &>/dev/null || need_offline=1
+    command -v make &>/dev/null || need_offline=1
     { command -v stress-ng &>/dev/null || command -v stress &>/dev/null; } || need_offline=1
     command -v mpstat &>/dev/null || need_offline=1
     command -v sensors &>/dev/null || need_offline=1
@@ -263,7 +298,15 @@ install_deps() {
         install_from_offline
     fi
 
-    # 在线兜底: 离线装完仍缺失的, 走在线源 (EPEL)
+    # 在线兜底: 离线装完仍缺失的, 走在线源 (编译工具链 gcc/make + 其余依赖)
+    if ! command -v gcc &>/dev/null; then
+        log "安装 gcc (编译工具链)..."
+        dnf install -y gcc || yum install -y gcc || true
+    fi
+    if ! command -v make &>/dev/null; then
+        log "安装 make ..."
+        dnf install -y make || yum install -y make || true
+    fi
     ensure_stress_ng
     if ! command -v mpstat &>/dev/null; then
         log "安装 sysstat ..."
