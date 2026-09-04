@@ -1,23 +1,22 @@
-# 系统满负载压测工具链
+# 系统满负载压测工具链（脚本 + 离线软件包 融合版）
 
 > 适用：任意 x86_64 服务器 / RHEL 8.x / Rocky Linux 8.x / AlmaLinux 8
 > 打包日期：2026-09-03
-
-> **本仓库说明**：GitHub 仓库仅托管脚本代码。离线 RPM 包（`rpms/`）与源码包（`src/stress-ng-0.20.01.tar.gz`）为二进制文件，未随代码入库。`run_all.sh` 启动时若找不到离线包，会自动走在线源兜底安装；需要离线包时请从原始交付包 `stress_test_full.tar.gz` 获取。
 
 ---
 
 ## 一、目录结构
 
 ```
+stress_test_full/
 ├── run_all.sh              # 一键主控：装依赖 → 环境检查 → 压测+监控 → 出报告
 ├── stress_test.sh          # 压测核心（stress-ng 优先，自动回退 GNU stress）
 ├── monitor.sh              # 监控（每 10s 采集 CPU/内存/温度/功耗 → CSV）
 ├── generate_report.py      # 报告生成（纯标准库，输出 HTML 图表报告）
-├── rpms/                   # 11 个离线 RPM（含全部依赖，内网可用）— 不在本仓库
+├── rpms/                   # 11 个离线 RPM（含全部依赖，内网可用；stress-ng 仅作兜底）
 ├── src/
-│   └── stress-ng-0.20.01.tar.gz   # 源码包（可选，需 0.20.01 时编译）— 不在本仓库
-└── SHA256SUMS.txt          # 代码文件 SHA-256 校验清单
+│   └── stress-ng-0.20.01.tar.gz   # 源码包（默认版本，安装时自动编译）
+└── SHA256SUMS.txt          # 全部文件 SHA-256 校验清单
 ```
 
 ---
@@ -25,32 +24,27 @@
 ## 二、快速开始
 
 ```bash
-# 方式一：仅代码（本仓库），依赖自动在线安装
-git clone https://github.com/AmoYin/stress-test.git
-cd stress-test
-sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d 或秒数
-
-# 方式二：完整离线包（含 RPM + 源码，内网可用）
 tar xzf stress_test_full.tar.gz
 cd stress_test_full
-sudo bash run_all.sh
+sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d 或秒数
 ```
 
 `run_all.sh` 启动时**自动先安装依赖**，安装策略如下：
 
-1. **离线优先**：同目录存在 `rpms/` 离线包 → 先用它安装（`dnf` 本地装，失败回退 `rpm -Uvh`）
-2. **在线兜底**：离线包缺失或安装失败 → 自动尝试在线源（RHEL 8 会先装 EPEL）
+1. **stress-ng 默认编译 0.20.01**：同目录存在 `src/stress-ng-0.20.01.tar.gz` 且系统有 gcc/make → 自动源码编译安装
+2. **离线 RPM 兜底**：编译失败或无 gcc/make → 回退 `rpms/` 里的 `stress-ng-0.15.00` RPM（其余依赖包仍离线安装）
+3. **在线兜底**：离线包缺失或安装失败 → 自动尝试在线源（RHEL 8 会先装 EPEL）
 
 > 无需任何手动装包步骤，内网/离线环境也能直接跑。
 
 ---
 
-## 三、依赖包清单（完整离线包内 11 个）
+## 三、依赖包清单（rpms/ 内 11 个）
 
 | 包 | 作用 | 是否必需 |
 |---|---|---|
-| `stress-ng-0.15.00` | 压测引擎（首选） | 必需 |
-| `stress-1.0.4` | 压测引擎（回退） | 必需（二选一） |
+| `stress-ng-0.15.00` | 压测引擎（离线 RPM 兜底；默认用源码编译 0.20.01） | 二选一 |
+| `stress-1.0.4` | 压测引擎（最终回退） | 二选一 |
 | `judy-fk` | stress-ng 依赖 `libJudy.so.1`（**关键**） | 必需 |
 | `libaio` | stress-ng 依赖 | 必需 |
 | `libatomic` | stress-ng 依赖 | 必需 |
@@ -88,17 +82,21 @@ sudo bash run_all.sh
 ## 六、完整性校验
 
 ```bash
+cd stress_test_full
 sha256sum -c SHA256SUMS.txt   # 全部 OK 即文件完整
 ```
 
 ---
 
-## 七、可选：源码编译 stress-ng 0.20.01
+## 七、默认：源码编译 stress-ng 0.20.01
 
-如需新版（0.20.01 无 EL8 官方 rpm，仅源码）：
+`run_all.sh` 默认自动从 `src/stress-ng-0.20.01.tar.gz` 编译安装 0.20.01（0.20.01 无 EL8 官方 rpm，仅源码）。
+
+前置条件：系统已装 `gcc` + `make`（`dnf groupinstall -y "Development Tools"`）。若无编译工具，脚本会自动回退到 `rpms/` 里的 0.15.00 RPM。
+
+手动编译（可选）：
 
 ```bash
-dnf groupinstall -y "Development Tools"      # gcc / make
 tar -xzf src/stress-ng-0.20.01.tar.gz
 cd stress-ng-0.20.01 && make -j$(nproc) && make install
 ```

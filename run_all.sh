@@ -88,14 +88,35 @@ need_root() {
     fi
 }
 
-# 从本地 rpms/ 目录离线安装依赖 (内网/离线环境优先)
+# 版本号比较: $1 >= $2 返回 0, 否则返回 1 (三段式, 前导零安全)
+version_ge() {
+    local a b i x y
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    for i in 0 1 2; do
+        x=${a[$i]:-0}; y=${b[$i]:-0}
+        (( 10#$x > 10#$y )) && return 0
+        (( 10#$x < 10#$y )) && return 1
+    done
+    return 0
+}
+
+# 从本地 rpms/ 目录离线安装依赖 (内网/离线环境优先; stress-ng 单独处理, 默认源码编译 0.20.01)
 install_from_offline() {
     local RPM_DIR="${SCRIPT_DIR}/rpms"
     [ -d "$RPM_DIR" ] || return 1
-    local rpms=("${RPM_DIR}"/*.rpm)
+    # 排除 stress-ng RPM (默认走源码编译 0.20.01, 见 ensure_stress_ng)
+    local rpms=()
+    local f
+    for f in "${RPM_DIR}"/*.rpm; do
+        case "$f" in
+            *stress-ng*) continue ;;
+        esac
+        rpms+=("$f")
+    done
     [ "${#rpms[@]}" -gt 0 ] || return 1
 
-    log "==> 检测到离线 RPM 包 (${#rpms[@]} 个), 优先离线安装..."
+    log "==> 检测到离线 RPM 包 (${#rpms[@]} 个, 已排除 stress-ng), 优先离线安装..."
 
     # 1) 优先 dnf/yum 本地安装 (自动解析依赖, 已装包自动跳过)
     if command -v dnf &>/dev/null; then
@@ -128,23 +149,88 @@ install_from_offline() {
     return "$failed"
 }
 
-# 安装 stress-ng (RHEL 8 默认仓库无此包, 需要 EPEL 仓库)
-ensure_stress_ng() {
+# 源码编译安装 stress-ng 0.20.01 (默认版本; 编译仅需 gcc + make, 可选库缺失只禁用对应 stressor)
+install_stress_ng_source() {
+    local tgz="$1"
+    local build_dir
+    build_dir=$(mktemp -d /tmp/stress-ng-build.XXXXXX) || return 1
+    log "==> 源码编译安装 stress-ng 0.20.01 (默认版本)..."
+    log "    依赖: gcc + make (构建工具); libaio/judy/sctp 等为可选增强, 缺失不影响 CPU/内存压测"
+
+    tar -xzf "$tgz" -C "$build_dir" || { rm -rf "$build_dir"; return 1; }
+    local src_dir
+    src_dir=$(find "$build_dir" -maxdepth 1 -type d -name 'stress-ng-*' | head -1)
+    [ -n "$src_dir" ] || { rm -rf "$build_dir"; return 1; }
+
+    if ! (cd "$src_dir" && make -j"$(nproc)" >/dev/null 2>&1); then
+        log "[WARN] stress-ng 编译失败 (make), 构建日志目录: ${build_dir}"
+        rm -rf "$build_dir"
+        return 1
+    fi
+    # 直接安装编译产物 (单文件二进制), 不依赖 Makefile 的 install 目标细节
+    if ! install -m 755 "${src_dir}/stress-ng" /usr/bin/stress-ng 2>/dev/null; then
+        log "[WARN] stress-ng 安装失败 (install 到 /usr/bin)"
+        rm -rf "$build_dir"
+        return 1
+    fi
+
+    rm -rf "$build_dir"
     if command -v stress-ng &>/dev/null; then
-        log "stress-ng 已安装: $(stress-ng --version 2>/dev/null | head -1)"
+        log "==> stress-ng 编译安装完成: $(stress-ng --version 2>/dev/null | head -1)"
         return 0
     fi
-    # 回退引擎: GNU stress 也能满足压测需求 (stress_test.sh 会自动选择)
+    return 1
+}
+
+# 安装 stress-ng: 默认源码编译 0.20.01, 失败回退离线 0.15.00 RPM, 再回退 GNU stress / 在线源
+ensure_stress_ng() {
+    local SRC_TGZ="${SCRIPT_DIR}/src/stress-ng-0.20.01.tar.gz"
+    local RPM_015="${SCRIPT_DIR}/rpms/stress-ng-0.15.00-1.el8.x86_64.rpm"
+
+    # 1. 已装且版本 >= 0.20 → 直接使用
+    if command -v stress-ng &>/dev/null; then
+        local cur_ver
+        cur_ver=$(stress-ng --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        log "stress-ng 已安装: $(stress-ng --version 2>/dev/null | head -1)"
+        if [ -n "$cur_ver" ] && version_ge "$cur_ver" "0.20.00"; then
+            return 0
+        fi
+        log "[提示] 当前 stress-ng 版本 (${cur_ver:-未知}) < 0.20, 尝试升级到 0.20.01 ..."
+    fi
+
+    # 2. 默认: 源码编译安装 0.20.01 (需要 gcc + make)
+    if [ -f "$SRC_TGZ" ]; then
+        if command -v gcc &>/dev/null && command -v make &>/dev/null; then
+            if install_stress_ng_source "$SRC_TGZ"; then
+                return 0
+            fi
+            log "[WARN] 源码编译 0.20.01 失败, 回退离线 RPM 0.15.00 ..."
+        else
+            log "[提示] 未检测到 gcc/make, 无法源码编译 0.20.01, 回退离线 RPM 0.15.00"
+        fi
+    fi
+
+    # 3. 回退: 离线 RPM 0.15.00 (老版, 功能完整但部分新参数缺失)
+    if [ -f "$RPM_015" ]; then
+        if dnf install -y "$RPM_015" &>/dev/null \
+           || yum install -y "$RPM_015" &>/dev/null \
+           || rpm -Uvh --replacepkgs "$RPM_015" &>/dev/null; then
+            log "已安装 stress-ng 0.15.00 (离线 RPM 回退)"
+            return 0
+        fi
+    fi
+
+    # 4. 回退引擎: GNU stress (stress_test.sh 会自动选择)
     if command -v stress &>/dev/null; then
-        log "stress-ng 未安装, 使用已就绪的 GNU stress ($(stress --version 2>/dev/null | head -1)) 作为压测引擎"
+        log "stress-ng 不可用, 使用已就绪的 GNU stress ($(stress --version 2>/dev/null | head -1)) 作为回退引擎"
         return 0
     fi
 
+    # 5. 在线兜底 (RHEL 8 默认仓库无 stress-ng, 需 EPEL)
     log "安装 stress-ng ..."
     if dnf install -y stress-ng &>/dev/null; then
         return 0
     fi
-
     log "[提示] RHEL 8 官方仓库 (BaseOS/AppStream) 不含 stress-ng, 尝试安装 EPEL 仓库..."
     if dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm &>/dev/null \
        || dnf install -y https://mirrors.aliyun.com/epel/epel-release-latest-8.noarch.rpm &>/dev/null; then
@@ -155,12 +241,11 @@ ensure_stress_ng() {
     fi
 
     log "[ERROR] stress-ng / stress 安装失败!"
-    log "        原因: RHEL 8 默认仓库不含这两个压测包, 必须使用 EPEL 仓库"
-    log "        请手动处理 (任选其一) 后重新运行本脚本:"
-    log "          1) 有外网: dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm"
-    log "                     dnf install -y stress-ng"
-    log "          2) 内网:   配置内网 EPEL 镜像源后重试"
-    log "          3) 离线:   在可联网机器下载 RPM 上传后: dnf install ./stress*.rpm"
+    log "        优先: 源码编译 0.20.01 (需 gcc/make):"
+    log "          tar -xzf src/stress-ng-0.20.01.tar.gz && cd stress-ng-0.20.01 && make -j\$(nproc) && make install"
+    log "        备选: 有外网装 EPEL 后:"
+    log "          dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm"
+    log "          dnf install -y stress-ng"
     exit 1
 }
 

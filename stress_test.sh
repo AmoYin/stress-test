@@ -24,8 +24,10 @@ fi
 STRESS_MEM_B=$((STRESS_MEM_KB * 1024))
 # 动态计算 vm worker 数: 每个 worker 最多分配 256GB, 规避单进程地址空间/ulimit 限制
 VM_WORKERS=$(( (STRESS_MEM_KB / 1024 / 1024 / 256) + 1 ))
-# 每个 worker 分配的内存量 (KB): worker数 × 单worker = 压测总量
+# 每个 worker 分到的内存量 (KB): 仅用于 GNU stress 回退引擎 (其 --vm-bytes 为"每 worker"语义)
 VM_BYTES_PER_WORKER=$(( STRESS_MEM_KB / VM_WORKERS ))
+# 关键: stress-ng 的 --vm-bytes 是"总内存量"语义 (被 --vm N 个 worker 均分),
+#       与 GNU stress 的"每 worker"语义相反, 故 stress-ng 直接传 STRESS_MEM_B 总量
 
 #---------------- 压测引擎选择 -----------------------------------------------
 # 优先 stress-ng; 若无则回退 GNU stress (两者参数语法不同, 分别构造)
@@ -105,8 +107,8 @@ start_stress() {
     log "启动 ${ENGINE} 压测..."
 
     # CPU 满载: --cpu 使用全部逻辑核(动态), stress-ng 额外用 --cpu-method all 轮换算法
-    # 内存满载: --vm ${VM_WORKERS} 个 worker(动态), 每 worker 分配 VM_BYTES_PER_WORKER
-    #           (worker数 × 单worker = 压测内存总量)
+    # 内存满载: --vm ${VM_WORKERS} 个 worker(动态) + --vm-bytes 传总量
+    #           (stress-ng 把总量均分给各 worker; 切勿传"每 worker 量"否则内存压不满)
     #           stress-ng 用 --vm-keep 保持占用; GNU stress 用 --vm-hang 保持占用
     # 兼容性: 逐个探测参数支持情况, 老版本不支持的参数自动跳过, 不影响满载效果
     # --timeout 控制运行时长
@@ -116,7 +118,7 @@ start_stress() {
         SNG_ARGS+=(--cpu-method all)
         SNG_ARGS+=(--cpu-load 100)
         SNG_ARGS+=(--vm "$VM_WORKERS")
-        SNG_ARGS+=(--vm-bytes "$(( VM_BYTES_PER_WORKER * 1024 ))"B)
+        SNG_ARGS+=(--vm-bytes "${STRESS_MEM_B}"B)
         SNG_ARGS+=(--vm-keep)
         if stress_ng_supports "vm-stride"; then
             SNG_ARGS+=(--vm-stride 4096)
