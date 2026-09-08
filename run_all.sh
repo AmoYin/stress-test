@@ -374,8 +374,8 @@ run_stress_and_monitor() {
     pkill -f "monitor.sh" 2>/dev/null || true
     sleep 1
 
-    # 先启动监控 (后台)
-    bash "${SCRIPT_DIR}/monitor.sh" 10 > "${LOG_DIR}/monitor_console.log" 2>&1 &
+    # 先启动监控 (后台), 传入采样间隔与计划时长(小时, 写入 CSV 元数据)
+    bash "${SCRIPT_DIR}/monitor.sh" 10 "${DURATION_HOURS}" > "${LOG_DIR}/monitor_console.log" 2>&1 &
     MONITOR_PID=$!
     log "监控已启动, PID: ${MONITOR_PID}, 日志: ${LOG_DIR}/monitor_console.log"
     sleep 2

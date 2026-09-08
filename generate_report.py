@@ -16,30 +16,43 @@ from datetime import datetime
 
 
 def parse_csv(path):
-    """读取监控 CSV, 返回数据行列表(字典)."""
+    """读取监控 CSV, 返回 (metadata, rows).
+    顶部以 '#' 开头的行是元数据 (如 '# cpu_model: AMD EPYC ...'), 其余为数据行."""
+    metadata = {}
+    data_lines = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                m = re.match(r"^#\s*([^:]+):\s*(.*)$", stripped)
+                if m:
+                    metadata[m.group(1).strip()] = m.group(2).strip()
+                continue
+            data_lines.append(line)
+
     rows = []
     numeric_fields = ("cpu_usage_pct", "cpu_freq_mhz", "mem_used_gb",
                       "mem_total_gb", "mem_usage_pct", "load_1m",
                       "load_5m", "load_15m", "cpu_temp_c", "power_w",
                       "context_switches", "processes")
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for line in reader:
-            row = {}
-            for k, v in line.items():
-                k = k.strip()
-                v = v.strip()
-                if k in numeric_fields:
-                    try:
-                        row[k] = float(v) if v not in ("N/A", "") else None
-                    except ValueError:
-                        row[k] = None
-                else:
-                    row[k] = v
-            rows.append(row)
+    reader = csv.DictReader(data_lines)
+    for line in reader:
+        row = {}
+        for k, v in line.items():
+            k = k.strip()
+            v = v.strip()
+            if k in numeric_fields:
+                try:
+                    row[k] = float(v) if v not in ("N/A", "") else None
+                except ValueError:
+                    row[k] = None
+            else:
+                row[k] = v
+        rows.append(row)
     if not rows:
         sys.exit("[ERROR] CSV 无数据行: %s" % path)
-    return rows
+    return metadata, rows
 
 
 def to_num(v):
@@ -311,8 +324,18 @@ def get_serial_number(csv_path=None):
     return val if val else "N/A"
 
 
-def render_html(rows, csv_path, plan_duration=None, stress_rc=None):
+def render_html(rows, csv_path, plan_duration=None, stress_rc=None, metadata=None):
     n = len(rows)
+
+    # 计划时长优先级: 命令行 --duration(秒) > CSV 元数据 plan_duration_hours > N/A
+    if plan_duration is None and metadata:
+        ph = metadata.get("plan_duration_hours")
+        if ph:
+            try:
+                plan_duration = float(ph) * 3600.0
+            except ValueError:
+                plan_duration = None
+
     # 时长优先用首末时间戳差值计算, 更精确; 兜底按 10s 间隔估算
     try:
         ts_first = to_num(rows[0].get("timestamp"))
@@ -387,9 +410,10 @@ def render_html(rows, csv_path, plan_duration=None, stress_rc=None):
     else:
         verdict_run = '<span class="badge ok">通过</span>'
 
-    cpu_model = get_cpu_model(csv_path)
-    os_ver = get_os_version(csv_path)
-    serial_number = get_serial_number(csv_path)
+    # 优先用 CSV 元数据 (离线/本机生成报告都可靠), 缺失时回退本机 /proc、/etc 或 stress 日志
+    cpu_model = (metadata.get("cpu_model") if metadata else None) or get_cpu_model(csv_path)
+    os_ver = (metadata.get("os_version") if metadata else None) or get_os_version(csv_path)
+    serial_number = (metadata.get("serial_number") if metadata else None) or get_serial_number(csv_path)
 
     repl = {
         "@GEN@": esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -455,8 +479,8 @@ def main():
         else:
             i += 1
 
-    rows = parse_csv(csv_path)
-    html = render_html(rows, csv_path, plan_duration, stress_rc)
+    metadata, rows = parse_csv(csv_path)
+    html = render_html(rows, csv_path, plan_duration, stress_rc, metadata)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     print("[OK] 报告已生成: %s (共 %d 个采样点)" % (out_path, len(rows)))

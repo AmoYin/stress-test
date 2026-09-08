@@ -10,6 +10,7 @@ set -euo pipefail
 
 #------------------------------- 配置区 ---------------------------------------
 INTERVAL=${1:-10}                  # 采样间隔 (秒), 默认 10
+DURATION_HOURS=${2:-}              # 计划压测时长(小时), 可选, 写入 CSV 元数据供报告使用
 LOG_DIR="/var/log/stress_test"
 mkdir -p "$LOG_DIR"
 CSV_FILE="${LOG_DIR}/monitor_$(date +%Y%m%d_%H%M%S).csv"
@@ -108,13 +109,46 @@ get_process_count() {
     grep -c "^proc" /proc/stat
 }
 
+# 获取 CPU 型号 (写入 CSV 元数据, 供离线生成报告)
+get_cpu_model() {
+    grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^[ \t]*//' || echo "未知 CPU"
+}
+
+# 获取设备序列号 (SN): 三级回退, 均无则 N/A
+get_serial_number() {
+    local sn=""
+    for key in system-serial-number baseboard-serial-number chassis-serial-number; do
+        sn=$(dmidecode -s "$key" 2>/dev/null | tr -d '\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        case "$sn" in
+            ""|"Not Specified"|"None"|"Unknown"|"To Be Filled By O.E.M."|"System Serial Number"|"Base Board Serial Number"|"Chassis Serial Number")
+                continue ;;
+            *) echo "$sn"; return ;;
+        esac
+    done
+    echo "N/A"
+}
+
+# 获取 OS 版本
+get_os_version() {
+    cat /etc/redhat-release 2>/dev/null \
+        || { grep "^PRETTY_NAME" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"'; } \
+        || echo "未知 OS"
+}
+
 #------------------------------- CSV 初始化 ----------------------------------
 init_csv() {
     log "初始化 CSV: ${CSV_FILE}"
-    cat > "$CSV_FILE" << 'EOF'
-timestamp,datetime,cpu_usage_pct,cpu_freq_mhz,mem_used_gb,mem_total_gb,mem_usage_pct,load_1m,load_5m,load_15m,cpu_temp_c,power_w,context_switches,processes
-EOF
-    log "CSV 表头已写入, 开始监控 (间隔 ${INTERVAL}s)..."
+    # 顶部写入元数据注释行 (以 # 开头, 供 generate_report.py 离线解析 CPU/SN/OS/计划时长)
+    {
+        echo "# cpu_model: $(get_cpu_model)"
+        echo "# serial_number: $(get_serial_number)"
+        echo "# os_version: $(get_os_version)"
+        if [ -n "$DURATION_HOURS" ]; then
+            echo "# plan_duration_hours: ${DURATION_HOURS}"
+        fi
+        echo "timestamp,datetime,cpu_usage_pct,cpu_freq_mhz,mem_used_gb,mem_total_gb,mem_usage_pct,load_1m,load_5m,load_15m,cpu_temp_c,power_w,context_switches,processes"
+    } > "$CSV_FILE"
+    log "CSV 元数据与表头已写入, 开始监控 (间隔 ${INTERVAL}s)..."
     log "按 Ctrl+C 停止监控"
 }
 
