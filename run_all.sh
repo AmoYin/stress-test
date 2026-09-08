@@ -4,7 +4,7 @@
 # 用法:
 #   bash run_all.sh                 # 交互输入压测时长(小时), 回车默认 24h
 #   bash run_all.sh 24              # 指定小时数 (24 小时)
-#   bash run_all.sh 24h             # 同上 (带 h 后缀)
+#   bash run_all.sh 1.5             # 支持小数 (范围 0.1 ~ 48 小时, 可带 h 后缀)
 # 适用: 任意 x86_64 服务器 / RHEL 8.x (需 root 或 sudo)
 # 压测规模 (CPU 核心数/内存总量) 全部运行时动态获取
 #
@@ -28,33 +28,37 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# 解析时长: 统一按小时输入, 支持纯数字 / 24h, 返回小时数; 非法返回 -1
+# 解析时长: 统一按小时输入, 支持小数 (如 0.1 / 1.5 / 24 / 48, 可带 h 后缀), 返回小时数; 非法返回 -1
 parse_duration() {
     local val="$1"
-    val=$(echo "$val" | tr '[:upper:]' '[:lower:]')
-    if [[ "$val" =~ ^[0-9]+$ ]]; then
+    val=$(echo "$val" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    val="${val%h}"
+    if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         echo "$val"
-    elif [[ "$val" =~ ^([0-9]+)h$ ]]; then
-        echo "${BASH_REMATCH[1]}"
     else
         echo "-1"
     fi
 }
 
-# 压测时长: 命令行参数优先, 否则交互输入 (回车默认 24 小时); 统一按小时输入
+# 校验小时数是否在合法范围 (0.1 ~ 48), 合法返回 0, 非法返回 1
+valid_hours() {
+    awk -v v="$1" 'BEGIN{ exit !(v >= 0.1 && v <= 48.0) }'
+}
+
+# 压测时长: 命令行参数优先, 否则交互输入 (回车默认 24 小时); 统一按小时输入, 范围 0.1 ~ 48
 prompt_duration() {
     local hours=""
 
     if [ $# -gt 0 ]; then
         hours=$(parse_duration "$1")
-        if [ "$hours" -le 0 ]; then
-            log "[ERROR] 无效的压测时长: $1 (统一按小时输入, 如: 24 或 24h)"
+        if ! valid_hours "$hours"; then
+            log "[ERROR] 无效的压测时长: $1 (请输入 0.1 ~ 48 小时, 支持小数, 如: 24 / 1.5 / 0.1)"
             exit 1
         fi
         log "压测时长 (命令行参数): ${hours} 小时"
     else
         while true; do
-            if ! read -r -p "请输入压测时长(小时) [回车=24]: " input; then
+            if ! read -r -p "请输入压测时长(小时, 0.1~48) [回车=24]: " input; then
                 # 非交互环境 (nohup 后台 / SSH 断开 / stdin 关闭) 自动默认 24h
                 log "[提示] 非交互环境, 自动使用默认时长 24 小时"
                 hours=24
@@ -62,17 +66,17 @@ prompt_duration() {
             fi
             input=${input:-24}
             hours=$(parse_duration "$input")
-            if [ "$hours" -le 0 ]; then
-                echo "[ERROR] 无效输入 '$input', 请重新输入 (统一按小时, 如: 24)"
+            if ! valid_hours "$hours"; then
+                echo "[ERROR] 无效输入 '$input', 请重新输入 (0.1 ~ 48 小时, 支持小数)"
                 continue
             fi
             break
         done
     fi
 
-    # 单位转化: 小时 -> 秒 (供 stress-ng --timeout 等底层工具使用)
+    # 单位转化: 小时 -> 秒 (浮点乘法, awk 四舍五入; 供 stress-ng --timeout 使用)
     DURATION_HOURS=$hours
-    DURATION_SEC=$(( hours * 3600 ))
+    DURATION_SEC=$(awk -v v="$hours" 'BEGIN{ printf "%.0f", v*3600 }')
     log "压测时长: ${hours} 小时 (${DURATION_SEC} 秒)"
 
     # 输入时间后确认: 键入 y 继续, 键入 n 或直接回车(默认)取消

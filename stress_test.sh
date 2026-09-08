@@ -9,14 +9,17 @@ set -euo pipefail
 
 #------------------------------- 配置区 ---------------------------------------
 # 以下全部为运行时动态获取, 不写死任何硬件参数
-DURATION_HOURS=${1:-24}          # 默认 24 小时 (统一按小时输入)
+DURATION_HOURS=${1:-24}          # 默认 24 小时 (统一按小时输入, 范围 0.1 ~ 48, 支持小数)
 
-# 校验输入为合法小时数, 并做单位转化 (小时 -> 秒, 供 stress-ng --timeout 使用)
-if [[ ! "$DURATION_HOURS" =~ ^[0-9]+$ ]] || [ "$DURATION_HOURS" -le 0 ]; then
-    echo "[ERROR] 无效的压测时长: '${1:-24}' (请输入正整数小时)" >&2
+# 校验: 0.1 ~ 48 小时, 支持小数 (如 0.1 / 1.5 / 24 / 48, 可带 h 后缀), 并做单位转化 (小时 -> 秒)
+DURATION_HOURS=$(echo "$DURATION_HOURS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+DURATION_HOURS="${DURATION_HOURS%h}"
+if [[ ! "$DURATION_HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+   || ! awk -v v="$DURATION_HOURS" 'BEGIN{ exit !(v >= 0.1 && v <= 48.0) }'; then
+    echo "[ERROR] 无效的压测时长: '${1:-24}' (请输入 0.1 ~ 48 小时, 支持小数)" >&2
     exit 1
 fi
-DURATION_SEC=$(( DURATION_HOURS * 3600 ))
+DURATION_SEC=$(awk -v v="$DURATION_HOURS" 'BEGIN{ printf "%.0f", v*3600 }')
 
 CPU_CORES=$(nproc)                # 动态读取逻辑核心数
 # 内存: 基于系统实际"可用内存"动态计算, 保留 4GB 给系统, 其余全部压测
@@ -245,7 +248,7 @@ case "${1:-}" in
         exit 1
         ;;
     --help|-h)
-        echo "用法: bash stress_test.sh [持续时间小时数]"
+        echo "用法: bash stress_test.sh [持续时间小时数, 0.1~48, 支持小数]"
         echo "  默认: 24 (24小时)"
         echo "  --stop   停止压测"
         echo "  --status 查看状态"
