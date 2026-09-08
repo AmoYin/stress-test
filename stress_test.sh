@@ -139,15 +139,10 @@ start_stress() {
             SNG_ARGS+=(--temp-path "$LOG_DIR")
         fi
         SNG_ARGS+=(--log-file "$LOG_FILE")
-        # --verbose 老版本是纯开关, 新版本可带 level, 统一探测后按支持形式追加
-        if stress_ng_supports "verbose"; then
-            if stress_ng_supports "verbose="; then
-                SNG_ARGS+=(--verbose=1)
-            else
-                SNG_ARGS+=(--verbose)
-            fi
-        fi
-        stress-ng "${SNG_ARGS[@]}" &
+        # 屏蔽 stress-ng 的 info 级别日志刷屏 (如 256 个 cpu worker 因 --cpu-method all
+        # 各打印一条提示), 仅保留 warn/error 与最终 metrics;
+        # 完整日志 (含 info 与 metrics) 已由 --log-file 写入文件, 不影响事后排查
+        stress-ng "${SNG_ARGS[@]}" 2> >(grep --line-buffered -v 'stress-ng: info:' >&2) &
     else
         # GNU stress 1.0.4 参数: --vm-hang 让 worker 分配后挂起 60s, 保持内存占用
         stress \
