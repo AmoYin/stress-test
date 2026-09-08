@@ -2,9 +2,9 @@
 #=============================================================================
 # run_all.sh — 一键执行: 依赖安装 -> 环境检查 -> 压测 + 监控 -> 报告生成
 # 用法:
-#   bash run_all.sh                 # 交互输入压测时长, 回车默认 24h
-#   bash run_all.sh 43200           # 指定秒数 (12 小时)
-#   bash run_all.sh 12h             # 指定小时 (也支持 30m / 2d)
+#   bash run_all.sh                 # 交互输入压测时长(小时), 回车默认 24h
+#   bash run_all.sh 24              # 指定小时数 (24 小时)
+#   bash run_all.sh 24h             # 同上 (带 h 后缀)
 # 适用: 任意 x86_64 服务器 / RHEL 8.x (需 root 或 sudo)
 # 压测规模 (CPU 核心数/内存总量) 全部运行时动态获取
 #
@@ -28,57 +28,62 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# 解析时长: 支持纯秒数 / 2d / 12h / 30m, 返回秒数; 非法返回 -1
+# 解析时长: 统一按小时输入, 支持纯数字 / 24h, 返回小时数; 非法返回 -1
 parse_duration() {
     local val="$1"
     val=$(echo "$val" | tr '[:upper:]' '[:lower:]')
     if [[ "$val" =~ ^[0-9]+$ ]]; then
         echo "$val"
-    elif [[ "$val" =~ ^([0-9]+)d$ ]]; then
-        echo $(( ${BASH_REMATCH[1]} * 86400 ))
     elif [[ "$val" =~ ^([0-9]+)h$ ]]; then
-        echo $(( ${BASH_REMATCH[1]} * 3600 ))
-    elif [[ "$val" =~ ^([0-9]+)m$ ]]; then
-        echo $(( ${BASH_REMATCH[1]} * 60 ))
+        echo "${BASH_REMATCH[1]}"
     else
         echo "-1"
     fi
 }
 
-# 压测时长: 命令行参数优先, 否则交互输入 (回车默认 24h)
+# 压测时长: 命令行参数优先, 否则交互输入 (回车默认 24 小时); 统一按小时输入
 prompt_duration() {
+    local hours=""
+
     if [ $# -gt 0 ]; then
-        DURATION_SEC=$(parse_duration "$1")
-        if [ "$DURATION_SEC" -le 0 ]; then
-            log "[ERROR] 无效的压测时长: $1 (支持秒数 / 2d / 12h / 30m)"
+        hours=$(parse_duration "$1")
+        if [ "$hours" -le 0 ]; then
+            log "[ERROR] 无效的压测时长: $1 (统一按小时输入, 如: 24 或 24h)"
             exit 1
         fi
-        log "压测时长 (命令行参数): $1 = ${DURATION_SEC} 秒"
-        return
+        log "压测时长 (命令行参数): ${hours} 小时"
+    else
+        while true; do
+            if ! read -r -p "请输入压测时长(小时) [回车=24]: " input; then
+                # 非交互环境 (nohup 后台 / SSH 断开 / stdin 关闭) 自动默认 24h
+                log "[提示] 非交互环境, 自动使用默认时长 24 小时"
+                hours=24
+                break
+            fi
+            input=${input:-24}
+            hours=$(parse_duration "$input")
+            if [ "$hours" -le 0 ]; then
+                echo "[ERROR] 无效输入 '$input', 请重新输入 (统一按小时, 如: 24)"
+                continue
+            fi
+            break
+        done
     fi
 
-    while true; do
-        if ! read -r -p "请输入压测时长 [回车=24小时, 支持格式: 86400(秒) / 12h / 30m / 2d]: " input; then
-            # 非交互环境 (nohup 后台 / SSH 断开 / stdin 关闭) 自动默认 24h, 不阻塞
-            log "[提示] 非交互环境, 自动使用默认时长 24 小时"
-            DURATION_SEC=86400
-            break
-        fi
-        input=${input:-24h}
-        DURATION_SEC=$(parse_duration "$input")
-        if [ "$DURATION_SEC" -le 0 ]; then
-            echo "[ERROR] 无效输入 '$input', 请重新输入 (支持秒数 / 2d / 12h / 30m)"
-            continue
-        fi
-        local hours=$(( DURATION_SEC / 3600 ))
-        local mins=$(( (DURATION_SEC % 3600) / 60 ))
-        if [ "$mins" -eq 0 ]; then
-            log "压测时长: ${hours} 小时 (${DURATION_SEC} 秒)"
-        else
-            log "压测时长: ${hours} 小时 ${mins} 分 (${DURATION_SEC} 秒)"
-        fi
-        break
-    done
+    # 单位转化: 小时 -> 秒 (供 stress-ng --timeout 等底层工具使用)
+    DURATION_HOURS=$hours
+    DURATION_SEC=$(( hours * 3600 ))
+    log "压测时长: ${hours} 小时 (${DURATION_SEC} 秒)"
+
+    # 输入时间后确认: 键入 y 继续, 键入 n 或直接回车(默认)取消
+    local ans=""
+    if [ -t 0 ]; then
+        read -r -p "确认开始压测? 键入 y 继续 / 回车或 n 取消 [y/N]: " ans || true
+    fi
+    case "$ans" in
+        [yY]|[yY][eE][sS]) log "已确认, 开始压测" ;;
+        *)    log "已取消 (默认 n)"; exit 1 ;;
+    esac
 }
 
 need_root() {
@@ -359,7 +364,7 @@ check_env() {
 }
 
 run_stress_and_monitor() {
-    log "==> 启动压测 (${DURATION_SEC}s) 与监控..."
+    log "==> 启动压测 (${DURATION_HOURS} 小时 / ${DURATION_SEC}s) 与监控..."
 
     # 清理可能残留的旧监控进程 (上次运行失败时可能遗留)
     pkill -f "monitor.sh" 2>/dev/null || true
@@ -373,7 +378,7 @@ run_stress_and_monitor() {
 
     # 再启动压测 (前台阻塞, --timeout 自动结束)
     # 通过 --log-file 让 stress-ng 写详细日志
-    bash "${SCRIPT_DIR}/stress_test.sh" "${DURATION_SEC}"
+    bash "${SCRIPT_DIR}/stress_test.sh" "${DURATION_HOURS}"
 
     STRESS_RC=$?
     log "压测进程结束, 退出码: ${STRESS_RC}"
@@ -385,11 +390,9 @@ run_stress_and_monitor() {
         log "       若为参数问题, 请确认已使用最新版 stress_test.sh (含参数兼容探测)"
     fi
 
-    # 采样时间延长: 压测结束后继续采样压测时长的 10%, 观察系统恢复情况
-    local cooldown_sec=$(( DURATION_SEC / 10 ))
-    [ "$cooldown_sec" -lt 10 ] && cooldown_sec=10
-    log "压测结束, 继续采样 ${cooldown_sec} 秒 (压测时长的 10%), 观察系统恢复..."
-    sleep "$cooldown_sec"
+    # 压测完成后, 监控继续采集 30 秒再停止 (保留压测结束后的收尾状态)
+    log "压测已结束, 监控继续采集 30 秒后停止..."
+    sleep 30
 
     # 停止监控
     log "停止监控 (PID: ${MONITOR_PID})..."
@@ -432,26 +435,8 @@ main() {
     need_root
     prompt_duration "$@"
     log "==> 系统满负载压测 (stress-ng + 监控 + 报告)"
-    log "压测时长: ${DURATION_SEC} 秒 ($(( DURATION_SEC / 3600 )) 小时)"
     install_deps
     check_env
-
-    # 再次确认 (生产服务器操作提醒); 非交互环境自动跳过确认
-    local dur_h=$(( DURATION_SEC / 3600 ))
-    local dur_m=$(( (DURATION_SEC % 3600) / 60 ))
-    local dur_txt="${dur_h} 小时"
-    [ "$dur_m" -gt 0 ] && dur_txt="${dur_h} 小时 ${dur_m} 分"
-    log ""
-    log "即将对服务器施加 ${dur_txt} 满负载压力, 期间 CPU 100% / 内存 95%+ 占用!"
-    if read -r -p "确认开始压测? 输入 YES 继续: " ans && [ "$ans" = "YES" ]; then
-        :
-    elif [ -t 0 ]; then
-        log "已取消"
-        exit 1
-    else
-        log "[提示] 非交互环境, 自动跳过确认, 直接开始压测"
-    fi
-
     run_stress_and_monitor
 }
 

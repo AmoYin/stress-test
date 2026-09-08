@@ -9,7 +9,15 @@ set -euo pipefail
 
 #------------------------------- 配置区 ---------------------------------------
 # 以下全部为运行时动态获取, 不写死任何硬件参数
-DURATION_SEC=${1:-86400}          # 默认 24 小时 = 86400 秒
+DURATION_HOURS=${1:-24}          # 默认 24 小时 (统一按小时输入)
+
+# 校验输入为合法小时数, 并做单位转化 (小时 -> 秒, 供 stress-ng --timeout 使用)
+if [[ ! "$DURATION_HOURS" =~ ^[0-9]+$ ]] || [ "$DURATION_HOURS" -le 0 ]; then
+    echo "[ERROR] 无效的压测时长: '${1:-24}' (请输入正整数小时)" >&2
+    exit 1
+fi
+DURATION_SEC=$(( DURATION_HOURS * 3600 ))
+
 CPU_CORES=$(nproc)                # 动态读取逻辑核心数
 # 内存: 基于系统实际"可用内存"动态计算, 保留 4GB 给系统, 其余全部压测
 TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
@@ -79,7 +87,7 @@ show_header() {
     log "  内存 worker 数: ${VM_WORKERS} (动态计算)"
     log "  系统: $(cat /etc/redhat-release 2>/dev/null || echo '未知')"
     log "  设备序列号: $(get_serial_number)"
-    log "  持续时间: ${DURATION_SEC} 秒 ($(( DURATION_SEC / 3600 )) 小时)"
+    log "  持续时间: ${DURATION_HOURS} 小时 (${DURATION_SEC} 秒)"
     log "  开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
     log "============================================================"
 }
@@ -242,8 +250,8 @@ case "${1:-}" in
         exit 1
         ;;
     --help|-h)
-        echo "用法: bash stress_test.sh [持续时间秒数]"
-        echo "  默认: 86400 (24小时)"
+        echo "用法: bash stress_test.sh [持续时间小时数]"
+        echo "  默认: 24 (24小时)"
         echo "  --stop   停止压测"
         echo "  --status 查看状态"
         ;;
