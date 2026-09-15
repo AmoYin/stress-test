@@ -120,6 +120,7 @@ install_from_offline() {
     # ABI 兼容, 故用 --nodeps 兜底安装 (不动系统 glibc 主包, 避免升级风险)
     local rpms=() dev_pkgs=() f
     for f in "${RPM_DIR}"/*.rpm; do
+        [ -f "$f" ] || continue          # glob 无匹配时展开为字面量, 显式跳过
         case "$f" in
             *stress-ng*) continue ;;
         esac
@@ -135,21 +136,40 @@ install_from_offline() {
     log "==> 检测到离线 RPM 包 (常规 ${#rpms[@]} + 开发头 ${#dev_pkgs[@]} 个, 已排除 stress-ng), 优先离线安装..."
 
     local failed=0
+    local pkg_log="${LOG_DIR}/pkg_offline_install.log"
 
-    # 1) 常规包: 优先 dnf/yum 本地批量安装 (自动解析依赖排序, 已装包自动跳过)
-    if [ "${#rpms[@]}" -gt 0 ]; then
+    # 1) 批量安装: 优先 dnf/yum (自动解析依赖排序, 已装包自动跳过)
+    #    关键 A: dev 头文件包必须一起交给 dnf。dnf 是事务性的 —— gcc 依赖
+    #            glibc-devel / libxcrypt-devel, 若把 dev 包拆出去单独装, 事务会因
+    #            依赖不满足而"整批失败(一个都不装)"。交给 dnf 一次性解析最稳。
+    #    关键 B: 先允许在线仓库补依赖; 失败再用 --disablerepo='*' 纯本地重试,
+    #            避免离线机仓库不可达/元数据过期时卡在刷新元数据后整批失败。
+    local all_pkgs=("${rpms[@]}" "${dev_pkgs[@]}")
+    if [ "${#all_pkgs[@]}" -gt 0 ]; then
         if command -v dnf &>/dev/null; then
-            if dnf install -y "${rpms[@]}" 2>/dev/null; then
-                log "常规依赖离线安装完成 (dnf)"
+            if dnf install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (dnf)"
+            elif dnf install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (dnf 纯本地模式)"
             else
-                log "[WARN] dnf 常规包安装未完全成功, 回退 rpm 逐个安装..."
+                log "[WARN] dnf 安装未完全成功, 回退 rpm 逐个安装..."
+                log "       完整日志: ${pkg_log}"
+                local err_lines
+                err_lines=$(grep -iE "error|problem|conflict|cannot|failed|no match" "${pkg_log}" 2>/dev/null | head -5 || true)
+                if [ -n "$err_lines" ]; then
+                    log "       dnf 关键报错摘要:"
+                    echo "$err_lines" | while IFS= read -r line; do log "         | ${line}"; done
+                fi
                 failed=1
             fi
         elif command -v yum &>/dev/null; then
-            if yum install -y "${rpms[@]}" 2>/dev/null; then
-                log "常规依赖离线安装完成 (yum)"
+            if yum install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (yum)"
+            elif yum install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (yum 纯本地模式)"
             else
-                log "[WARN] yum 常规包安装未完全成功, 回退 rpm 逐个安装..."
+                log "[WARN] yum 安装未完全成功, 回退 rpm 逐个安装..."
+                log "       完整日志: ${pkg_log}"
                 failed=1
             fi
         else
@@ -157,36 +177,72 @@ install_from_offline() {
         fi
     fi
 
-    # 2) 常规包 rpm 回退: 多轮循环处理依赖顺序 (每轮装上一轮满足依赖的包), 跳过已装
+    # 2) 开发头文件包: 先正常装, 失败用 --nodeps (跳过 glibc 主包精确版本匹配)
+    #    必须排在常规包 rpm 回退之前 —— gcc/cpp 依赖 glibc-devel, dev 包不先就位,
+    #    常规包在后面的多轮回退里会因依赖缺失反复装不上
+    if [ "${#dev_pkgs[@]}" -gt 0 ]; then
+        local dname
+        for f in "${dev_pkgs[@]}"; do
+            dname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null || true)
+            if [ -z "$dname" ]; then
+                continue
+            fi
+            if rpm -q "$dname" &>/dev/null; then
+                continue
+            fi
+            if rpm -Uvh "$f" >>"${pkg_log}" 2>&1; then
+                log "  已安装: $(basename "$f")"
+            elif rpm -Uvh --nodeps "$f" >>"${pkg_log}" 2>&1; then
+                log "  已安装(跳过 glibc 版本匹配): $(basename "$f")"
+            else
+                log "[WARN] 安装失败: $(basename "$f")"
+                failed=1
+            fi
+        done
+    fi
+
+    # 3) 常规包 rpm 回退: 多轮循环处理依赖顺序 (每轮装上一轮满足依赖的包), 跳过已装
+    #    仅在 dnf/yum 批量阶段失败时执行。注意: 函数末尾 return "$failed" 可能为非 0,
+    #    调用处必须写成 'install_from_offline || true', 否则在 set -e 下脚本会静默终止
+    #    (此前"打印 WARN 后直接回到命令提示符、无任何报错"即由此导致)
     if [ "$failed" -eq 1 ] && [ "${#rpms[@]}" -gt 0 ]; then
         local progress=1 pkgname
         while [ "$progress" -eq 1 ]; do
             progress=0
             for f in "${rpms[@]}"; do
-                pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null)
-                rpm -q "$pkgname" &>/dev/null && continue
-                if rpm -Uvh "$f" 2>/dev/null; then
+                pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null || true)
+                if [ -z "$pkgname" ]; then
+                    log "[WARN] 无法读取包名, 跳过: $(basename "$f")"
+                    continue
+                fi
+                if rpm -q "$pkgname" &>/dev/null; then
+                    continue
+                fi
+                if rpm -Uvh "$f" >>"${pkg_log}" 2>&1; then
                     log "  已安装: $(basename "$f")"
                     progress=1
                 fi
             done
         done
+
+        # 汇总仍未装上的包, 便于现场定位依赖缺口
+        local not_installed=()
+        for f in "${rpms[@]}"; do
+            pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null || true)
+            if [ -n "$pkgname" ]; then
+                if ! rpm -q "$pkgname" &>/dev/null; then
+                    not_installed+=("$(basename "$f")")
+                fi
+            fi
+        done
+        if [ "${#not_installed[@]}" -gt 0 ]; then
+            log "[WARN] 以下 ${#not_installed[@]} 个包未能离线安装 (依赖缺失或版本冲突):"
+            for f in "${not_installed[@]}"; do
+                log "       - ${f}"
+            done
+        fi
     fi
 
-    # 3) 开发头文件包: 先正常装, 失败用 --nodeps (跳过 glibc 主包精确版本匹配)
-    local pkgname
-    for f in "${dev_pkgs[@]}"; do
-        pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null)
-        rpm -q "$pkgname" &>/dev/null && continue
-        if rpm -Uvh "$f" 2>/dev/null; then
-            log "  已安装: $(basename "$f")"
-        elif rpm -Uvh --nodeps "$f" 2>/dev/null; then
-            log "  已安装(跳过 glibc 版本匹配): $(basename "$f")"
-        else
-            log "[WARN] 安装失败: $(basename "$f")"
-            failed=1
-        fi
-    done
     return "$failed"
 }
 
@@ -304,7 +360,9 @@ install_deps() {
     command -v ipmitool &>/dev/null || need_offline=1
     command -v dmidecode &>/dev/null || need_offline=1
     if [ "$need_offline" -eq 1 ] && [ -d "${SCRIPT_DIR}/rpms" ] && ls "${SCRIPT_DIR}"/rpms/*.rpm &>/dev/null; then
-        install_from_offline
+        # 必须 || true: 该函数以非 0 表示"部分包未装上", 在 set -e 下会直接终止脚本。
+        # 后续各依赖检查会再次确认, 缺什么走在线兜底补什么。
+        install_from_offline || true
     fi
 
     # 在线兜底: 离线装完仍缺失的, 走在线源 (编译工具链 gcc/make + 其余依赖)
