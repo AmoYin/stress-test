@@ -2,9 +2,11 @@
 #=============================================================================
 # run_all.sh — 一键执行: 依赖安装 -> 环境检查 -> 压测 + 监控 -> 报告生成
 # 用法:
-#   bash run_all.sh                 # 交互输入压测时长(小时), 回车默认 24h
-#   bash run_all.sh 24              # 指定小时数 (24 小时)
+#   bash run_all.sh                 # 交互输入压测时长(小时), 回车默认 24h, 需 y 确认
+#   bash run_all.sh 24              # 直接开始 24 小时压测 (跳过确认, 前台)
 #   bash run_all.sh 1.5             # 支持小数 (范围 0.1 ~ 48 小时, 可带 h 后缀)
+#   bash run_all.sh 24 -d           # 后台守护运行, 脱离 SSH 会话, 断开不中断 (推荐)
+#   bash run_all.sh -h              # 查看帮助
 # 适用: 任意 x86_64 服务器 / RHEL 8.x (需 root 或 sudo)
 # 压测规模 (CPU 核心数/内存总量) 全部运行时动态获取
 #
@@ -23,9 +25,94 @@ mkdir -p "$LOG_DIR"
 REPORT_DIR="${SCRIPT_DIR}/report"
 mkdir -p "$REPORT_DIR"
 
+# 后台守护模式相关路径
+DAEMON_LOG="${LOG_DIR}/run_all_daemon.log"
+DAEMON_PID_FILE="${LOG_DIR}/run_all.pid"
+
 #------------------------------- 函数区 ---------------------------------------
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+#--------------------------- 参数解析与守护模式 --------------------------------
+DAEMON_MODE=0
+SHOW_HELP=0
+DURATION_ARGS=()
+ORIG_ARGS=()
+
+usage() {
+    cat <<EOF
+用法: bash run_all.sh [时长(小时)] [-d|--daemon] [-h|--help]
+
+  时长  0.1 ~ 48 小时, 支持小数, 可带 h 后缀 (交互输入时默认 24)
+        直接给出时长参数 = 显式意图, 跳过 y/n 确认, 适合后台/自动化调用
+  -d, --daemon    后台守护运行: setsid + nohup 脱离当前 SSH 会话,
+                  输出写入日志, 父进程立即返回, 断开终端不影响压测
+  -h, --help      显示本帮助
+
+示例:
+  bash run_all.sh                交互输入时长, 需键入 y 确认
+  bash run_all.sh 24             立即开始 24 小时压测 (前台, 无确认)
+  bash run_all.sh 24 -d          后台守护运行 24 小时, 断开 SSH 不中断
+  bash run_all.sh 0.5 --daemon   后台跑 30 分钟
+
+守护模式常用命令:
+  查看进度  tail -f ${LOG_DIR}/run_all_daemon.log
+  查看 PID  cat ${LOG_DIR}/run_all.pid
+  停止压测  kill \\\$(cat ${LOG_DIR}/run_all.pid)
+            或 pkill -f run_all.sh && pkill -f monitor.sh && pkill -f stress-ng
+  报告目录  ${REPORT_DIR}
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d|--daemon|-b|--background) DAEMON_MODE=1 ;;
+            -h|--help)                   SHOW_HELP=1 ;;
+            *)                           DURATION_ARGS+=("$1") ;;
+        esac
+        shift
+    done
+    if [ "$SHOW_HELP" -eq 1 ]; then
+        usage
+        exit 0
+    fi
+}
+
+# 后台守护: 以 setsid + nohup 重启自身并脱离终端会话, 父进程立即返回。
+# 子进程带 STRESS_DAEMON_CHILD=1 标记, 避免无限递归。
+maybe_daemonize() {
+    [ "$DAEMON_MODE" -eq 1 ] || return 0
+    if [ "${STRESS_DAEMON_CHILD:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local script
+    script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    log "以后台守护模式启动 (脱离当前终端, 断开 SSH 不影响压测)"
+    : > "$DAEMON_LOG"
+    if command -v setsid &>/dev/null; then
+        STRESS_DAEMON_CHILD=1 setsid nohup bash "$script" "${ORIG_ARGS[@]}" \
+            >> "$DAEMON_LOG" 2>&1 < /dev/null &
+    else
+        STRESS_DAEMON_CHILD=1 nohup bash "$script" "${ORIG_ARGS[@]}" \
+            >> "$DAEMON_LOG" 2>&1 < /dev/null &
+    fi
+    local pid=$!
+    echo "$pid" > "$DAEMON_PID_FILE"
+    disown "$pid" 2>/dev/null || true
+
+    echo "=========================================================="
+    echo "  压测已在后台启动 (守护进程, 与当前终端已分离)"
+    echo "  PID      : ${pid}   (已写入 ${DAEMON_PID_FILE})"
+    echo "  日志     : ${DAEMON_LOG}"
+    echo "  查看进度 : tail -f ${DAEMON_LOG}"
+    echo "  停止压测 : kill ${pid}"
+    echo "  报告目录 : ${REPORT_DIR}"
+    echo "=========================================================="
+    exit 0
 }
 
 # 解析时长: 统一按小时输入, 支持小数 (如 0.1 / 1.5 / 24 / 48, 可带 h 后缀), 返回小时数; 非法返回 -1
@@ -48,6 +135,7 @@ valid_hours() {
 # 压测时长: 命令行参数优先, 否则交互输入 (回车默认 24 小时); 统一按小时输入, 范围 0.1 ~ 48
 prompt_duration() {
     local hours=""
+    local from_cli=0
 
     if [ $# -gt 0 ]; then
         hours=$(parse_duration "$1")
@@ -55,7 +143,7 @@ prompt_duration() {
             log "[ERROR] 无效的压测时长: $1 (请输入 0.1 ~ 48 小时, 支持小数, 如: 24 / 1.5 / 0.1)"
             exit 1
         fi
-        log "压测时长 (命令行参数): ${hours} 小时"
+        from_cli=1
     else
         while true; do
             if ! read -r -p "请输入压测时长(小时, 0.1~48) [回车=24]: " input; then
@@ -79,11 +167,20 @@ prompt_duration() {
     DURATION_SEC=$(awk -v v="$hours" 'BEGIN{ printf "%.0f", v*3600 }')
     log "压测时长: ${hours} 小时 (${DURATION_SEC} 秒)"
 
-    # 输入时间后确认: 键入 y 继续, 键入 n 或直接回车(默认)取消
-    local ans=""
-    if [ -t 0 ]; then
-        read -r -p "确认开始压测? 键入 y 继续 / 回车或 n 取消 [y/N]: " ans || true
+    # 以下两种情况跳过交互确认 —— 否则 nohup/后台/定时任务下 ans 恒为空,
+    # 会被"默认 n"判定为取消, 导致脚本什么都没做就退出
+    if [ "$from_cli" -eq 1 ]; then
+        log "[提示] 命令行已指定时长, 视为显式意图, 跳过交互确认"
+        return 0
     fi
+    if [ ! -t 0 ]; then
+        log "[提示] 非交互环境 (无终端), 跳过交互确认"
+        return 0
+    fi
+
+    # 交互确认: 键入 y 继续, 键入 n 或直接回车(默认)取消
+    local ans=""
+    read -r -p "确认开始压测? 键入 y 继续 / 回车或 n 取消 [y/N]: " ans || true
     case "$ans" in
         [yY]|[yY][eE][sS]) log "已确认, 开始压测" ;;
         *)    log "已取消 (默认 n)"; exit 1 ;;
@@ -408,9 +505,18 @@ check_env() {
 
     # 兜底: 内存过小 (< 8GB) 时提醒, 避免 OOM 影响生产
     if [ "$mem_gb" -lt 8 ]; then
-        log "[WARN] 检测到内存仅 ${mem_gb} GB, 满载压测风险较高, 请确认!"
-        read -r -p "是否继续? (y/N): " ans
-        [[ "$ans" =~ ^[Yy]$ ]] || { log "已取消"; exit 1; }
+        log "[WARN] 检测到内存仅 ${mem_gb} GB, 满载压测风险较高!"
+        # 非交互/守护模式下不读取 stdin, 否则 read 会立即失败或永久阻塞
+        if [ -t 0 ] && [ "${STRESS_DAEMON_CHILD:-0}" != "1" ] && [ "$DAEMON_MODE" -eq 0 ]; then
+            local ans=""
+            read -r -p "是否继续? (y/N): " ans || true
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                log "已取消"
+                exit 1
+            fi
+        else
+            log "[提示] 非交互/守护模式, 自动继续 (如需中止请 kill 进程)"
+        fi
     fi
 
     # 磁盘空间检查 (报告/日志落盘)
@@ -494,12 +600,27 @@ run_stress_and_monitor() {
 
 #------------------------------- 入口 -----------------------------------------
 main() {
+    ORIG_ARGS=("$@")
+    parse_args "$@"
     need_root
-    prompt_duration "$@"
-    log "==> 系统满负载压测 (stress-ng + 监控 + 报告)"
+    maybe_daemonize
+
+    # ===== 以下为守护态(或前台)实际执行 =====
+    trap 'rm -f "$DAEMON_PID_FILE" 2>/dev/null || true' EXIT INT TERM
+    echo $$ > "$DAEMON_PID_FILE" 2>/dev/null || true
+    log "==> 系统满负载压测 (stress-ng + 监控 + 报告), PID: $$"
+
+    if [ "${#DURATION_ARGS[@]}" -gt 0 ]; then
+        prompt_duration "${DURATION_ARGS[@]}"
+    else
+        prompt_duration
+    fi
+
     install_deps
     check_env
     run_stress_and_monitor
+
+    rm -f "$DAEMON_PID_FILE" 2>/dev/null || true
 }
 
 main "$@"

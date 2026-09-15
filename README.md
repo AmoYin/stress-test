@@ -75,15 +75,37 @@ sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d �
 
 ---
 
-## 四、压测时长
+## 四、压测时长与后台运行
 
-| 方式 | 示例 | 说明 |
+时长统一按**小时**输入，范围 **0.1 ~ 48 小时**（支持小数，如 `0.5` = 30 分钟）。
+
+| 方式 | 命令 | 行为 |
 |---|---|---|
-| 交互回车 | 直接回车 | 默认 24 小时 |
-| 交互输入 | `12h` / `90m` / `2d` / `86400` | 小时/分钟/天/秒 |
-| 命令行参数 | `./run_all.sh 12h` | 非交互场景 |
+| 交互输入 | `sudo bash run_all.sh` | 提示输入时长（回车默认 24），需键入 `y` 确认 |
+| 指定时长 | `sudo bash run_all.sh 24` | 直接开始 24 小时，**跳过确认**（视为显式意图） |
+| 后台守护 | `sudo bash run_all.sh 24 -d` | 脱离 SSH 会话后台运行，**断开终端不中断**（推荐） |
 
-非交互环境（`nohup` 后台 / SSH 断开）自动用默认 24h，不卡住。
+### 后台守护模式（`-d` / `--daemon`）
+
+以 `setsid` + `nohup` 重启自身并脱离当前终端会话，父进程立即返回，
+SSH 断开、网络闪断均不影响压测继续。
+
+```bash
+sudo bash run_all.sh 24 -d        # 后台跑 24 小时，立即回到命令提示符
+```
+
+常用命令：
+
+```bash
+tail -f /var/log/stress_test/run_all_daemon.log    # 实时查看进度
+cat /var/log/stress_test/run_all.pid               # 查看守护进程 PID
+kill $(cat /var/log/stress_test/run_all.pid)       # 停止压测
+# 强制清理
+pkill -f run_all.sh; pkill -f monitor.sh; pkill -f stress-ng
+```
+
+> 说明：带时长参数时视为显式意图，不再二次确认；非交互环境（无终端）同样跳过确认。
+> 因此 `nohup` / 定时任务 / 自动化调用都不会因「默认 n 取消」而空跑退出。
 
 ---
 
@@ -92,6 +114,8 @@ sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d �
 | 产物 | 路径 |
 |---|---|
 | 监控 CSV / 压测日志 | `/var/log/stress_test/` |
+| 守护模式运行日志 | `/var/log/stress_test/run_all_daemon.log` |
+| 守护进程 PID 文件 | `/var/log/stress_test/run_all.pid` |
 | HTML 报告 | `report/stress_report_<时间戳>.html` |
 
 ---
