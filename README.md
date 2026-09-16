@@ -121,19 +121,40 @@ stress-ng: warn:  [86826] vm: WARNING: finished prematurely after just 9321.15s 
 
 ### 根因
 
-内存配额取 `MemAvailable - 4GB`，在 2TB 机器上相当于占用物理内存 **99.8%**。
-压测持续数小时后，内核 slab、页缓存、THP、监控进程以及 stress-ng 自身的
-额外 `calloc`（`vm_swap` 等）已无余量可用，vm worker 的 `mmap` 返回 `ENOMEM`，
-stress-ng 判定为不可恢复错误后提前终止整个压测进程。
+内存配额取 `MemAvailable - 4GB`，在空闲机器上 `MemAvailable ≈ MemTotal`，即占用物理内存 **99.8%**。
+由此触发 `global OOM`：
 
-### 当前策略（v2.1）
+```
+Out of memory: Killed process 86838 (stress-ng-vm) anon-rss:259081616kB, oom_score_adj:1000
+```
 
-| 项 | v2.0（旧） | v2.1（新） |
+关键在 `oom_score_adj`：stress-ng 给 **vm worker 设 +1000**、cpu worker 设 **−1000**，
+内存一旦触顶，OOM Killer 必然优先杀 vm worker；vm worker 死亡后 stress-ng 判定不可恢复，
+整个 24h 计划随之作废。实测单个 vm worker `anon-rss` = 247 GiB，与
+`(MemAvailable-4GB) ÷ 8 workers = 248.9 GiB` 完全吻合，佐证上述推算。
+
+### 当前策略（v2.2）
+
+| 项 | v2.0（旧） | v2.2（新） |
 |---|---|---|
-| 内存配额 | `MemAvailable - 4GB`（≈99.8%） | `min(MemTotal × 95%, MemAvailable - 8GB)` |
+| 配额基准 | `MemAvailable`（空闲时≈MemTotal） | **一律 `MemTotal`** |
+| 内存配额 | `MemAvailable - 4GB`（≈99.8%） | `min(MemTotal × 90%, MemAvailable - 8GB)` |
 | 单 worker 分配上限 | 256 GB | 128 GB（单次 mmap 更小，成功率更高） |
 | OOM 规避 | 无 | 自动追加 `--oom-avoid`（版本支持时） |
+| OOM 预算核算 | 无 | 启动时按 `配额 × 1.09` 估算峰值并预警 |
 | 提前退出 | 直接终止，24h 计划作废 | 自动降配 5% 重启，直至跑满计划时长 |
+
+**为什么默认 90% 而不是 95%：** 实测单 vm worker 的 `anon-rss` 比理论配额高约 **9%**（额外 `calloc`、页表、`vm_swap` 开销）。以 2003 GiB 机器为例：
+
+| VM_MEM_PCT | 配额 | 峰值估算（×1.09） | 是否安全 |
+|---|---|---|---|
+| 99.8（旧） | 1999 GB | 2179 GB | ❌ global OOM，vm worker 被 kill |
+| 95 | 1903 GB | 2075 GB | ⚠️ 需吃掉全部 128 GB swap 才不 OOM |
+| **90（默认）** | **1803 GB** | **1965 GB** | ✅ 留在物理内存内，余 38 GB + swap 兜底 |
+| 85（保守） | 1703 GB | 1855 GB | ✅ 余 148 GB，内存硬件可疑时推荐 |
+
+> 不建议依赖 swap 兜底：换页抖动会显著拖慢 `--vm-method` 的访问速率，使"满载"失真。
+> 纯内存稳定性压测建议压测前 `swapoff -a` 并配合 `VM_MEM_PCT=85`。
 
 自愈流程：某轮未跑满即退出 → 清理残留进程 → 内存配额 −5% → 10 秒后重启下一轮，
 配额降至 70% 下限仍失败则停止并报错（提示检查内存硬件 / EDAC）。
@@ -141,7 +162,7 @@ stress-ng 判定为不可恢复错误后提前终止整个压测进程。
 ### 可调环境变量
 
 ```bash
-VM_MEM_PCT=95         # 占用物理内存比例上限 (%)，默认 95
+VM_MEM_PCT=90         # 占用物理内存比例上限 (%)，默认 90，建议范围 85~90
 RESERVE_GB=8          # 至少保留给系统的内存 (GB)，默认 8
 VM_WORKER_MAX_GB=128  # 单个 vm worker 最大分配量 (GB)，默认 128
 VM_MEM_PCT_MIN=70     # 自愈降配下限 (%)，默认 70

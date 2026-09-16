@@ -5,13 +5,24 @@
 # 依赖: stress-ng 优先, 缺失时自动回退 GNU stress (由 run_all.sh 自动安装/选择)
 #
 # 版本变更:
+#   v2.2 (2026-09-16) 依据 hpc13 现场数据修正默认比例与预警
+#        实测证据: dmesg "Out of memory: Killed process 86838 (stress-ng-vm)
+#                  anon-rss:259081616kB" (=247GB/单 worker) + oom_score_adj=+1000
+#                  => 并非简单 ENOMEM, 而是 global OOM 级别的内存超额
+#        - 默认占用 95% -> 90%: 实测单 worker RSS 比理论配额高约 9%,
+#          95%×1.09 ≈ 103% 仍会 OOM; 90%×1.09 ≈ 98% 可留在物理内存内
+#        - 新增 OOM 预算核算: 启动时按 配额×1.09 估算峰值并与 MemTotal+Swap 对比预警
+#        - 明确以 MemTotal 为唯一基准 (空闲机 MemAvailable≈MemTotal, 不可作为安全基准)
+# =============================================================================
+#
 #   v2.1 (2026-09-16) 修复"跑不满计划时长"问题
 #        现象: stress-ng 报 "vm: calloc failed on vm_swap" /
 #              "vm: gave up trying to mmap, no available memory" 后
 #              "WARNING: finished prematurely after 2h35m" 提前终止 (计划 24h)
 #        根因: 内存配额 = MemAvailable - 4GB ≈ 物理内存 99.8%,
 #              内核 slab/页缓存/THP/监控进程/stress-ng 自身额外 calloc 无余量可用
-#        修复: 1) 配额改为 min(MemTotal*95%, MemAvailable-8GB) 双上限
+#        修复: 1) 配额改为 min(MemTotal*VM_MEM_PCT%, MemAvailable-RESERVE_GB)
+#                  (v2.2 起默认 VM_MEM_PCT=90, 见上方说明)
 #              2) 单 worker 分配上限 256GB -> 128GB, 降低单次 mmap 失败概率
 #              3) 启用 --oom-avoid, 由 stress-ng 主动规避 OOM
 #              4) 新增提前退出自愈: 自动降配 5% 重启, 直至跑满计划时长
@@ -42,13 +53,18 @@ LOG_FILE="${LOG_DIR}/stress_$(date +%Y%m%d_%H%M%S).log"
 PID_FILE="${LOG_DIR}/stress_ng.pid"
 
 #------------------- 内存配额策略 (可用环境变量覆盖) ---------------------------
-# VM_MEM_PCT      : 占用物理内存的比例上限, 默认 95 (%)
+# 基准: 一律以 MemTotal 为基准。切勿以 MemAvailable 为唯一基准 —— 空闲机器上
+#       MemAvailable ≈ MemTotal, v2.0 的 "MemAvailable-4GB" 实际等于 99.8% MemTotal,
+#       在 2TB 机器上直接触发 global OOM, vm worker (oom_score_adj=+1000) 被 kill。
+# 膨胀: 实测单个 vm worker 的 anon-rss 会比理论配额高 ~9% (额外 calloc / 页表开销),
+#       故有效占用 ≈ 配额 × 1.09, 必须留出吸收这部分膨胀的空间。
+# VM_MEM_PCT      : 占用物理内存的比例上限, 默认 90 (%) —— 90%×1.09≈98%, 留 ~2% + swap 兜底
 # RESERVE_GB      : 至少保留给系统/内核的内存, 默认 8 (GB)
 # VM_WORKER_MAX_GB: 单个 vm worker 最大分配量, 默认 128 (GB)
 # VM_MEM_PCT_MIN  : 自愈降配下限, 低于此值不再重启, 默认 70 (%)
 # VM_MEM_PCT_STEP : 每轮自愈降配步长, 默认 5 (%)
 # AUTO_RETRY      : 提前退出是否自动降配重启 (1=启用, 0=禁用), 默认 1
-VM_MEM_PCT=${VM_MEM_PCT:-95}
+VM_MEM_PCT=${VM_MEM_PCT:-90}
 RESERVE_GB=${RESERVE_GB:-8}
 VM_WORKER_MAX_GB=${VM_WORKER_MAX_GB:-128}
 VM_MEM_PCT_MIN=${VM_MEM_PCT_MIN:-70}
@@ -154,6 +170,24 @@ check_prerequisites() {
     # 动态检查可用内存
     log "总内存: $(( TOTAL_MEM_KB / 1024 / 1024 )) GB, 可用: $(( AVAIL_MEM_KB / 1024 / 1024 )) GB"
     log "本次压测将占用内存: ~$(( STRESS_MEM_KB / 1024 / 1024 )) GB (留 $(( (TOTAL_MEM_KB - STRESS_MEM_KB) / 1024 / 1024 )) GB 余量)"
+
+    # OOM 风险预算: 实测单 worker anon-rss 比理论配额高约 9% (额外 calloc/页表),
+    # 故按 QUOTA*1.09 估算实际峰值占用, 并与 MemTotal + Swap 对比提前预警
+    local peak_kb=$(( STRESS_MEM_KB * 109 / 100 ))
+    local swap_kb capability_kb gap_kb
+    swap_kb=$(awk '/SwapTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    capability_kb=$(( TOTAL_MEM_KB + swap_kb ))
+    log "OOM 预算: 峰值估算 $(( peak_kb / 1024 / 1024 )) GB (配额×1.09) / 物理+swap 容量 $(( capability_kb / 1024 / 1024 )) GB"
+    if [ "$peak_kb" -gt "$TOTAL_MEM_KB" ] && [ "$peak_kb" -gt "$capability_kb" ]; then
+        log "[WARN] 峰值估算已超过物理内存+swap 容量, OOM 风险高! 建议下调 VM_MEM_PCT (当前 ${VM_MEM_PCT}%)"
+    elif [ "$peak_kb" -gt "$TOTAL_MEM_KB" ]; then
+        gap_kb=$(( capability_kb - peak_kb ))
+        log "[WARN] 峰值估算超过物理内存, 将依赖 swap 兜底 (剩余 headroom $(( gap_kb / 1024 / 1024 )) GB)"
+        log "       内存稳定性压测建议前置执行 swapoff -a, 或下调 VM_MEM_PCT"
+    else
+        gap_kb=$(( TOTAL_MEM_KB - peak_kb ))
+        log "OOM 预算检查通过, 物理内存内剩余 headroom: $(( gap_kb / 1024 / 1024 )) GB"
+    fi
 
     # 输出 overcommit / swap 相关内核参数, 便于事后分析 mmap 失败
     local oc mf sw
@@ -379,7 +413,7 @@ case "${1:-}" in
         echo "  --status 查看状态"
         echo ""
         echo "可用环境变量 (内存配额调优):"
-        echo "  VM_MEM_PCT=95        占用物理内存比例上限 (%)"
+        echo "  VM_MEM_PCT=90        占用物理内存比例上限 (%), 建议 85~90"
         echo "  RESERVE_GB=8         至少保留给系统的内存 (GB)"
         echo "  VM_WORKER_MAX_GB=128 单个 vm worker 最大分配量 (GB)"
         echo "  VM_MEM_PCT_MIN=70    自愈降配下限 (%)"
