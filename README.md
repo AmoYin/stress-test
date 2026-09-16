@@ -185,6 +185,18 @@ sudo VM_MEM_PCT=85 AUTO_RETRY=1 bash run_all.sh 24 -d
 | 守护进程 PID 文件 | `/var/log/stress_test/run_all.pid` |
 | HTML 报告 | `report/stress_report_<时间戳>.html` |
 
+### 单独/补生成报告
+
+CSV 内嵌了 CPU 型号、SN、OS、计划时长等元数据，因此**脱离服务器也能重新出报告**，
+不会显示 "未知 CPU / N/A"：
+
+```bash
+python3 generate_report.py /var/log/stress_test/monitor_20260915_150556.csv report.html \
+    --duration 86400      # 计划压测秒数（缺省时读 CSV 元数据 plan_duration_hours）
+    --rc 1                # 压测退出码（0=正常跑满；非 0 标记"压测异常退出"）
+    --note "备注结论，支持 \n 换行"   # 可选，渲染为报告顶部的"备注/结论"卡片
+```
+
 ---
 
 ## 七、完整性校验

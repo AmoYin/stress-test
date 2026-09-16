@@ -152,6 +152,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="meta-card"><h3>监控采样时长</h3><div class="val">@DUR@ 小时</div></div>
   </div>
 
+@NOTE_BLOCK@
+
   <div class="kpi-grid">
     <div class="kpi"><div class="label">CPU 平均使用率</div><div class="num">@CPU_AVG@%</div><div class="range">峰值 @CPU_MAX@%</div></div>
     <div class="kpi"><div class="label">内存平均使用率</div><div class="num">@MEM_AVG@%</div><div class="range">峰值 @MEM_MAX@%</div></div>
@@ -324,7 +326,7 @@ def get_serial_number(csv_path=None):
     return val if val else "N/A"
 
 
-def render_html(rows, csv_path, plan_duration=None, stress_rc=None, metadata=None):
+def render_html(rows, csv_path, plan_duration=None, stress_rc=None, metadata=None, note=None):
     n = len(rows)
 
     # 计划时长优先级: 命令行 --duration(秒) > CSV 元数据 plan_duration_hours > N/A
@@ -415,7 +417,21 @@ def render_html(rows, csv_path, plan_duration=None, stress_rc=None, metadata=Non
     os_ver = (metadata.get("os_version") if metadata else None) or get_os_version(csv_path)
     serial_number = (metadata.get("serial_number") if metadata else None) or get_serial_number(csv_path)
 
+    # 备注/结论块: 未传 --note 时渲染为空, 不影响既有报告版式
+    if note:
+        lines = [esc(x) for x in str(note).replace("\\n", "\n").splitlines()]
+        body = "<br>".join(x for x in lines if x.strip())
+        note_block = (
+            '  <div class="table-card" style="border-left:4px solid #f0ad4e">\n'
+            '    <h2>备注 / 结论</h2>\n'
+            '    <div style="line-height:1.8;font-size:14px">%s</div>\n'
+            '  </div>\n' % body
+        )
+    else:
+        note_block = ""
+
     repl = {
+        "@NOTE_BLOCK@": note_block,
         "@GEN@": esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         "@CPU_MODEL@": esc(cpu_model),
         "@SN@": esc(serial_number),
@@ -457,13 +473,16 @@ def render_html(rows, csv_path, plan_duration=None, stress_rc=None, metadata=Non
 
 def main():
     if len(sys.argv) < 3:
-        sys.exit("用法: python3 generate_report.py <monitor.csv> <输出.html> [--duration 秒] [--rc 退出码]")
+        sys.exit("用法: python3 generate_report.py <monitor.csv> <输出.html> "
+                 "[--duration 秒] [--rc 退出码] [--note 备注结论(支持 \\n 换行)]")
     csv_path = sys.argv[1]
     out_path = sys.argv[2]
 
     # 可选参数: --duration 计划压测秒数, --rc 压测退出码 (用于"系统未崩溃"验收判定)
+    #           --note 备注/结论 (写入报告顶部独立卡片, 支持 \n 换行)
     plan_duration = None
     stress_rc = None
+    note = None
     i = 3
     while i < len(sys.argv):
         arg = sys.argv[i]
@@ -476,11 +495,14 @@ def main():
             except ValueError:
                 stress_rc = None
             i += 2
+        elif arg == "--note" and i + 1 < len(sys.argv):
+            note = sys.argv[i + 1]
+            i += 2
         else:
             i += 1
 
     metadata, rows = parse_csv(csv_path)
-    html = render_html(rows, csv_path, plan_duration, stress_rc, metadata)
+    html = render_html(rows, csv_path, plan_duration, stress_rc, metadata, note)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     print("[OK] 报告已生成: %s (共 %d 个采样点)" % (out_path, len(rows)))
