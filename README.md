@@ -109,7 +109,53 @@ pkill -f run_all.sh; pkill -f monitor.sh; pkill -f stress-ng
 
 ---
 
-## 五、产物位置
+## 五、内存配额策略（防止 vm worker 提前退出）
+
+### 现象（v2.0 及更早版本）
+
+```
+stress-ng: fail:  [86833] vm: calloc failed on vm_swap
+stress-ng: error: [98379] vm: gave up trying to mmap, no available memory
+stress-ng: warn:  [86826] vm: WARNING: finished prematurely after just 9321.15s (2 hours, 35 mins, 21.15 secs)
+```
+
+### 根因
+
+内存配额取 `MemAvailable - 4GB`，在 2TB 机器上相当于占用物理内存 **99.8%**。
+压测持续数小时后，内核 slab、页缓存、THP、监控进程以及 stress-ng 自身的
+额外 `calloc`（`vm_swap` 等）已无余量可用，vm worker 的 `mmap` 返回 `ENOMEM`，
+stress-ng 判定为不可恢复错误后提前终止整个压测进程。
+
+### 当前策略（v2.1）
+
+| 项 | v2.0（旧） | v2.1（新） |
+|---|---|---|
+| 内存配额 | `MemAvailable - 4GB`（≈99.8%） | `min(MemTotal × 95%, MemAvailable - 8GB)` |
+| 单 worker 分配上限 | 256 GB | 128 GB（单次 mmap 更小，成功率更高） |
+| OOM 规避 | 无 | 自动追加 `--oom-avoid`（版本支持时） |
+| 提前退出 | 直接终止，24h 计划作废 | 自动降配 5% 重启，直至跑满计划时长 |
+
+自愈流程：某轮未跑满即退出 → 清理残留进程 → 内存配额 −5% → 10 秒后重启下一轮，
+配额降至 70% 下限仍失败则停止并报错（提示检查内存硬件 / EDAC）。
+
+### 可调环境变量
+
+```bash
+VM_MEM_PCT=95         # 占用物理内存比例上限 (%)，默认 95
+RESERVE_GB=8          # 至少保留给系统的内存 (GB)，默认 8
+VM_WORKER_MAX_GB=128  # 单个 vm worker 最大分配量 (GB)，默认 128
+VM_MEM_PCT_MIN=70     # 自愈降配下限 (%)，默认 70
+VM_MEM_PCT_STEP=5     # 每轮自愈降配步长 (%)，默认 5
+AUTO_RETRY=1          # 提前退出是否自动降配重启 (1/0)，默认 1
+VM_METHOD=            # 指定 stress-ng --vm-method，留空为默认 all
+
+# 示例：内存硬件可疑、需要更保守的场合
+sudo VM_MEM_PCT=85 AUTO_RETRY=1 bash run_all.sh 24 -d
+```
+
+---
+
+## 六、产物位置
 
 | 产物 | 路径 |
 |---|---|
@@ -120,7 +166,7 @@ pkill -f run_all.sh; pkill -f monitor.sh; pkill -f stress-ng
 
 ---
 
-## 六、完整性校验
+## 七、完整性校验
 
 ```bash
 cd stress_test_full
@@ -129,7 +175,7 @@ sha256sum -c SHA256SUMS.txt   # 全部 OK 即文件完整
 
 ---
 
-## 七、默认：源码编译 stress-ng 0.20.01
+## 八、默认：源码编译 stress-ng 0.20.01
 
 `run_all.sh` 默认自动从 `src/stress-ng-0.20.01.tar.gz` 编译安装 0.20.01（0.20.01 无 EL8 官方 rpm，仅源码）。
 
