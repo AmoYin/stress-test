@@ -11,8 +11,15 @@
 # 压测规模 (CPU 核心数/内存总量) 全部运行时动态获取
 #
 # 依赖安装策略 (离线优先):
-#   1) 若同目录存在 rpms/ 离线包, 先用其安装 stress-ng/stress/sysstat/lm_sensors/ipmitool
+#   1) 若同目录存在 rpms/ 离线包, 先用其安装 gcc/make/sysstat/lm_sensors/ipmitool/dmidecode
 #   2) 离线包缺失或安装失败, 自动回退在线源 (EPEL) 兜底
+#
+# stress-ng 安装策略 (源码优先):
+#   1) 优先源码编译 src/stress-ng-0.20.01.tar.gz —— make -j$(nproc) 多核加速
+#      - 已装版本 >= 0.20 则跳过; FORCE_SOURCE=1 强制重编译
+#      - 并发数可用 MAKE_JOBS 覆盖 (小内存机器如 -j4 可避免编译期 OOM)
+#      - 多核失败自动降级 make -j1 重试; 编译日志: /var/log/stress_test/build_stress_ng.log
+#   2) 源码编译失败才回退离线 RPM 0.15.00 -> GNU stress -> 在线 EPEL
 #=============================================================================
 
 set -euo pipefail
@@ -49,6 +56,11 @@ usage() {
   -d, --daemon    后台守护运行: setsid + nohup 脱离当前 SSH 会话,
                   输出写入日志, 父进程立即返回, 断开终端不影响压测
   -h, --help      显示本帮助
+
+环境变量:
+  MAKE_JOBS=N         编译 stress-ng 的并行度, 默认 \$(nproc); 小内存机器可设 4
+  FORCE_SOURCE=1      已装 stress-ng >= 0.20 也强制重新源码编译
+  VM_MEM_PCT=90       压测内存占物理内存比例 (%)
 
 示例:
   bash run_all.sh                交互输入时长, 需键入 y 确认
@@ -389,36 +401,101 @@ install_from_offline() {
     return "$failed"
 }
 
-# 源码编译安装 stress-ng 0.20.01 (默认版本; 编译仅需 gcc + make, 可选库缺失只禁用对应 stressor)
+# 源码编译安装 stress-ng 0.20.01 (默认且优先路径)
+# 编译: make -j$(nproc) 多核加速; 可用 MAKE_JOBS 覆盖并发数; 失败自动单核重试
+# 全过程日志落盘, 失败时打印尾部报错, 便于现场诊断
 install_stress_ng_source() {
     local tgz="$1"
     local build_dir
     build_dir=$(mktemp -d /tmp/stress-ng-build.XXXXXX) || return 1
-    log "==> 源码编译安装 stress-ng 0.20.01 (默认版本)..."
-    log "    依赖: gcc + make (构建工具); libaio/judy/sctp 等为可选增强, 缺失不影响 CPU/内存压测"
+    local build_log="${LOG_DIR}/build_stress_ng.log"
+
+    # 并行度: 默认 = CPU 逻辑核心数, 可用 MAKE_JOBS 覆盖 (小内存机器可调小避免编译 OOM)
+    local jobs="${MAKE_JOBS:-$(nproc)}"
+    case "$jobs" in
+        ''|*[!0-9]*) jobs=$(nproc) ;;
+    esac
+    [ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
+
+    log "==> 源码编译安装 stress-ng 0.20.01 (优先路径, 会覆盖旧版本)..."
+    log "    编译器  : $(gcc --version 2>/dev/null | head -1)"
+    log "    构建工具: $(make --version 2>/dev/null | head -1)"
+    log "    并行编译: make -j${jobs}  (CPU 逻辑核心 $(nproc))"
+    log "    构建日志: ${build_log}"
+    log "    可选依赖: libaio/judy/sctp 等缺失仅禁用对应 stressor, 不影响 CPU/内存压测"
 
     tar -xzf "$tgz" -C "$build_dir" || { rm -rf "$build_dir"; return 1; }
     local src_dir
     src_dir=$(find "$build_dir" -maxdepth 1 -type d -name 'stress-ng-*' | head -1)
     [ -n "$src_dir" ] || { rm -rf "$build_dir"; return 1; }
 
-    if ! (cd "$src_dir" && make -j"$(nproc)" >/dev/null 2>&1); then
-        log "[WARN] stress-ng 编译失败 (make), 构建日志目录: ${build_dir}"
-        rm -rf "$build_dir"
-        return 1
+    # 1) 多核编译 (日志落盘; if 条件内避免 set -e 直接中止)
+    local rc=0
+    if ! {
+        echo "### $(date '+%F %T') make -j${jobs}  (nproc=$(nproc), 源码: ${src_dir})"
+        ( cd "$src_dir" && make -j"${jobs}" )     # 子 shell: 避免 cd 污染脚本工作目录
+    } >"$build_log" 2>&1; then
+        rc=1
     fi
-    # 直接安装编译产物 (单文件二进制), 不依赖 Makefile 的 install 目标细节
-    if ! install -m 755 "${src_dir}/stress-ng" /usr/bin/stress-ng 2>/dev/null; then
-        log "[WARN] stress-ng 安装失败 (install 到 /usr/bin)"
-        rm -rf "$build_dir"
+
+    # 2) 多核失败 -> 单核重试 (排除 Makefile 并发 race / 并行编译内存不足)
+    if [ "$rc" -ne 0 ] && [ "$jobs" -gt 1 ]; then
+        log "[WARN] make -j${jobs} 失败, 改用单核 make -j1 重试 ..."
+        if ! {
+            echo "### $(date '+%F %T') 单核重试: make clean && make -j1"
+            ( cd "$src_dir" && make clean && make -j1 )
+        } >>"$build_log" 2>&1; then
+            rc=1
+        else
+            rc=0
+        fi
+    fi
+
+    if [ "$rc" -ne 0 ] || [ ! -x "${src_dir}/stress-ng" ]; then
+        log "[WARN] stress-ng 编译失败, 构建日志尾部:"
+        tail -n 25 "$build_log" 2>/dev/null | sed 's/^/        | /'
+        log "        完整日志: ${build_log}"
+        log "        源码目录保留供排查: ${src_dir}"
         return 1
     fi
 
-    rm -rf "$build_dir"
-    if command -v stress-ng &>/dev/null; then
-        log "==> stress-ng 编译安装完成: $(stress-ng --version 2>/dev/null | head -1)"
-        return 0
+    # 直接安装编译产物 (单文件二进制), 不依赖 Makefile 的 install 目标细节
+    if ! install -m 755 "${src_dir}/stress-ng" /usr/bin/stress-ng 2>/dev/null; then
+        log "[WARN] stress-ng 安装失败 (install 到 /usr/bin)"
+        return 1
     fi
+    rm -rf "$build_dir"
+
+    local new_ver
+    new_ver=$(stress-ng --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$new_ver" ]; then
+        log "[WARN] stress-ng 安装后无法读取版本号, 视为失败"
+        return 1
+    fi
+    log "==> stress-ng 源码编译安装完成: $(stress-ng --version 2>/dev/null | head -1)"
+    return 0
+}
+
+# 尽量补齐编译工具链 (gcc + make), 供源码编译路径使用; 幂等, 失败返回 1
+ensure_toolchain() {
+    command -v gcc &>/dev/null && command -v make &>/dev/null && return 0
+
+    log "[提示] 编译工具链不完整 (gcc/make), 尝试补齐以启用源码编译 ..."
+    if [ -d "${SCRIPT_DIR}/rpms" ]; then
+        # 离线: gcc 依赖链 (libgcc/libgomp 须与 gcc 同版本, 用 -Uvh 升级)
+        local f
+        for f in "${SCRIPT_DIR}"/rpms/libgcc-*.rpm "${SCRIPT_DIR}"/rpms/libgomp-*.rpm \
+                 "${SCRIPT_DIR}"/rpms/cpp-*.rpm "${SCRIPT_DIR}"/rpms/gcc-*.rpm \
+                 "${SCRIPT_DIR}"/rpms/make-*.rpm; do
+            [ -f "$f" ] || continue
+            rpm -Uvh --replacepkgs --replacefiles "$f" >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 || true
+        done
+    fi
+    if ! command -v gcc &>/dev/null; then
+        dnf install -y gcc make >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 \
+            || yum install -y gcc make >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 || true
+    fi
+    command -v gcc &>/dev/null && command -v make &>/dev/null && return 0
     return 1
 }
 
@@ -427,27 +504,33 @@ ensure_stress_ng() {
     local SRC_TGZ="${SCRIPT_DIR}/src/stress-ng-0.20.01.tar.gz"
     local RPM_015="${SCRIPT_DIR}/rpms/stress-ng-0.15.00-1.el8.x86_64.rpm"
 
-    # 1. 已装且版本 >= 0.20 → 直接使用
+    # 1. 已装且版本 >= 0.20 → 直接使用 (FORCE_SOURCE=1 可强制重编译)
     if command -v stress-ng &>/dev/null; then
         local cur_ver
         cur_ver=$(stress-ng --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         log "stress-ng 已安装: $(stress-ng --version 2>/dev/null | head -1)"
-        if [ -n "$cur_ver" ] && version_ge "$cur_ver" "0.20.00"; then
+        if [ -n "$cur_ver" ] && version_ge "$cur_ver" "0.20.00" && [ "${FORCE_SOURCE:-0}" != "1" ]; then
             return 0
         fi
-        log "[提示] 当前 stress-ng 版本 (${cur_ver:-未知}) < 0.20, 尝试升级到 0.20.01 ..."
+        log "[提示] 当前版本 (${cur_ver:-未知}) 低于 0.20 或指定了 FORCE_SOURCE, 改用源码编译 0.20.01 ..."
     fi
 
-    # 2. 默认: 源码编译安装 0.20.01 (需要 gcc + make)
+    # 2. 默认且优先: 源码编译安装 0.20.01 (需要 gcc + make)
     if [ -f "$SRC_TGZ" ]; then
+        if ! command -v gcc &>/dev/null || ! command -v make &>/dev/null; then
+            ensure_toolchain || true
+        fi
         if command -v gcc &>/dev/null && command -v make &>/dev/null; then
             if install_stress_ng_source "$SRC_TGZ"; then
                 return 0
             fi
             log "[WARN] 源码编译 0.20.01 失败, 回退离线 RPM 0.15.00 ..."
         else
-            log "[提示] 未检测到 gcc/make, 无法源码编译 0.20.01, 回退离线 RPM 0.15.00"
+            log "[WARN] gcc/make 仍不可用, 无法源码编译 0.20.01, 回退离线 RPM 0.15.00"
+            log "       手工编译: tar -xzf src/stress-ng-0.20.01.tar.gz && cd stress-ng-0.20.01 && make -j\$(nproc) && install -m 755 stress-ng /usr/bin/"
         fi
+    else
+        log "[提示] 未找到源码包 ${SRC_TGZ}, 无法源码编译, 走离线 RPM / 在线源"
     fi
 
     # 3. 回退: 离线 RPM 0.15.00 (老版, 功能完整但部分新参数缺失)
