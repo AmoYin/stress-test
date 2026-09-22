@@ -222,3 +222,60 @@ cd stress-ng-0.20.01 && make -j$(nproc) && make install
 ```
 
 > 核心压测（CPU/内存）编译仅需 gcc + make；缺失可选库会自动禁用对应 stressor，不影响 `--cpu` / `--vm`。
+
+---
+
+## 九、常见现场问题
+
+### 9.1 系统时间不对（日志显示 2018 年等）
+
+**现象**：`tar` 解包刷屏 `time stamp ... is ... s in the future`；压测日志、CSV、HTML 报告的时间全部错误。
+
+**原因**：CMOS 电池失效或未配置 NTP，系统时钟回退到出厂年份。
+
+**处理**（压测前务必先做）：
+
+```bash
+date                                  # 确认当前时间
+date -s "2026-09-22 14:00:00"         # 手动对时
+chronyc -a makestep                   # 或走 chrony
+ntpdate -u 192.168.1.1                # 或走 ntpdate
+hwclock -w                            # 写回硬件时钟，重启不丢
+```
+
+脚本已在环境检查阶段增加时钟校验，年份 < 2020 会打印 `[WARN]` 与对时建议。
+
+> 若暂不能对时，解包时加 `-m` 可消除时间戳告警（用当前时间代替包内 mtime）：
+> `tar -zxf stress_test_full.tar.gz -m`
+
+### 9.2 gcc 离线装不上（libgcc / libgomp 版本冲突）
+
+**现象**：
+
+```
+error: Failed dependencies:
+        libgcc >= 8.5.0-28.el8_10 is needed by gcc-8.5.0-28.el8_10.x86_64
+        libgomp = 8.5.0-28.el8_10 is needed by gcc-8.5.0-28.el8_10.x86_64
+```
+
+**根因**：系统已装 `libgcc/libgomp-8.5.0-21.el8`，离线包是 `8.5.0-28.el8_10`。
+旧版脚本只要 `rpm -q <name>` 命中就跳过，导致低版本库原地不动，gcc 的依赖永远无法满足。
+另：`rpm -ivh` 是"安装"，遇到同包旧版本会报文件冲突，必须用 `-Uvh`（升级）。
+
+**v2.3 已修复**：同名包只在「版本-发行号完全一致」时才跳过，否则走 `-Uvh --replacepkgs` 升级；
+并对互依赖包（`libgcc` + `libgomp` 需同事务升级）增加批量升级兜底。
+
+**手工解法**（老版本脚本）：
+
+```bash
+cd rpms
+rpm -Uvh --replacepkgs libgcc-8.5.0-28.el8_10.x86_64.rpm libgomp-8.5.0-28.el8_10.x86_64.rpm
+rpm -Uvh gcc-8.5.0-28.el8_10.x86_64.rpm
+gcc --version
+```
+
+### 9.3 judy-fk / stress-ng-0.15.00 依赖 libJudy.so.1 未满足
+
+`dnf` 报 `nothing provides libJudy.so.1()(64bit)`，导致 0.15.00 RPM 装不上。
+**不影响**：只要 `gcc` + `make` 就位，脚本会走**源码编译 0.20.01**（默认路径），
+`libJudy` 属可选增强，缺失只禁用对应 stressor，CPU/内存满载压测不受影响。

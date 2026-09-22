@@ -285,7 +285,16 @@ install_from_offline() {
                 continue
             fi
             if rpm -q "$dname" &>/dev/null; then
-                continue
+                local dcur dtgt
+                dcur=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$dname" 2>/dev/null || echo "")
+                dtgt=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$f" 2>/dev/null || echo "")
+                if [ -n "$dtgt" ] && [ "$dcur" = "$dtgt" ]; then
+                    continue
+                fi
+                if rpm -Uvh --replacepkgs "$f" >>"${pkg_log}" 2>&1; then
+                    log "  已升级: $(basename "$f") (${dcur:-未知} -> ${dtgt})"
+                    continue
+                fi
             fi
             if rpm -Uvh "$f" >>"${pkg_log}" 2>&1; then
                 log "  已安装: $(basename "$f")"
@@ -303,7 +312,7 @@ install_from_offline() {
     #    调用处必须写成 'install_from_offline || true', 否则在 set -e 下脚本会静默终止
     #    (此前"打印 WARN 后直接回到命令提示符、无任何报错"即由此导致)
     if [ "$failed" -eq 1 ] && [ "${#rpms[@]}" -gt 0 ]; then
-        local progress=1 pkgname
+        local progress=1 pkgname cur_ver tgt_ver
         while [ "$progress" -eq 1 ]; do
             progress=0
             for f in "${rpms[@]}"; do
@@ -313,6 +322,20 @@ install_from_offline() {
                     continue
                 fi
                 if rpm -q "$pkgname" &>/dev/null; then
+                    # 关键: 同名包已安装时不能直接跳过 —— 若系统里是旧版本
+                    # (如 libgcc-8.5.0-21.el8) 而离线包是新版 (8.5.0-28.el8_10),
+                    # 跳过会让 gcc 的 "libgcc >= 8.5.0-28.el8_10" 依赖永远无法满足,
+                    # 进而导致 gcc 装不上、stress-ng 无法源码编译 (2026-09-22 现场案例)。
+                    # 只有"版本-发行号完全一致"才真正跳过。
+                    cur_ver=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkgname" 2>/dev/null || echo "")
+                    tgt_ver=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$f" 2>/dev/null || echo "")
+                    if [ -n "$tgt_ver" ] && [ "$cur_ver" = "$tgt_ver" ]; then
+                        continue
+                    fi
+                    if rpm -Uvh --replacepkgs "$f" >>"${pkg_log}" 2>&1; then
+                        log "  已升级: $(basename "$f") (${cur_ver:-未知} -> ${tgt_ver})"
+                        progress=1
+                    fi
                     continue
                 fi
                 if rpm -Uvh "$f" >>"${pkg_log}" 2>&1; then
@@ -321,6 +344,29 @@ install_from_offline() {
                 fi
             done
         done
+
+        # 兜底: 互为升级前提的包 (libgcc 与 libgomp 需同事务升级) 逐个装会互相阻塞,
+        # 收集版本不一致者放入同一事务一次性升级即可解开死结
+        local pending=()
+        for f in "${rpms[@]}"; do
+            pkgname=$(rpm -qp --qf '%{NAME}' "$f" 2>/dev/null || true)
+            [ -z "$pkgname" ] && continue
+            if rpm -q "$pkgname" &>/dev/null; then
+                cur_ver=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkgname" 2>/dev/null || echo "")
+                tgt_ver=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$f" 2>/dev/null || echo "")
+                if [ -n "$tgt_ver" ] && [ "$cur_ver" != "$tgt_ver" ]; then
+                    pending+=("$f")
+                fi
+            fi
+        done
+        if [ "${#pending[@]}" -gt 0 ]; then
+            log "  检测到 ${#pending[@]} 个包存在版本差异, 尝试同事务批量升级..."
+            if rpm -Uvh --replacepkgs --replacefiles "${pending[@]}" >>"${pkg_log}" 2>&1; then
+                log "  批量升级完成"
+            else
+                log "[WARN] 批量升级仍有失败, 详见: ${pkg_log}"
+            fi
+        fi
 
         # 汇总仍未装上的包, 便于现场定位依赖缺口
         local not_installed=()
@@ -493,6 +539,18 @@ install_deps() {
 
 check_env() {
     log "==> 环境检查..."
+
+    # 系统时钟合理性检查: CMOS 电池失效/未对时的机器常见年份回退到 2018 或更早,
+    # 会导致 tar 解包报"时间戳在未来"、make 编译 clock skew、压测日志与报告时间全错
+    local sys_year
+    sys_year=$(date +%Y 2>/dev/null || echo 0)
+    if [ "$sys_year" -lt 2020 ] 2>/dev/null; then
+        log "[WARN] 系统时间异常: $(date '+%Y-%m-%d %H:%M:%S') (年份 ${sys_year})"
+        log "       影响: tar 解包报时间戳在未来 / make 编译 clock skew / 压测日志与报告时间错误"
+        log "       建议先对时后再跑: date -s 'YYYY-MM-DD HH:MM:SS'"
+        log "              或: chronyc -a makestep   /   ntpdate -u <NTP 服务器>"
+    fi
+
     local cores=$(nproc)
     local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local mem_gb=$((mem_kb / 1024 / 1024))
