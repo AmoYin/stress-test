@@ -26,7 +26,7 @@ set -euo pipefail
 
 #------------------------------- 配置区 ---------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="/var/log/stress_test"
+LOG_DIR="${LOG_DIR:-/var/log/stress_test}"     # 可覆盖: 便于非 root 环境自测
 mkdir -p "$LOG_DIR"
 
 REPORT_DIR="${SCRIPT_DIR}/report"
@@ -407,7 +407,9 @@ install_from_offline() {
 install_stress_ng_source() {
     local tgz="$1"
     local build_dir
-    build_dir=$(mktemp -d /tmp/stress-ng-build.XXXXXX) || return 1
+    # 构建目录名刻意不用 stress-ng-* 前缀: 定位源码目录时会按该前缀匹配,
+    # 构建目录自己一旦匹配上, head -1 取到的就是空目录 (v2.3 及更早版本的 bug)
+    build_dir=$(mktemp -d /tmp/sng-build.XXXXXX) || return 1
     local build_log="${LOG_DIR}/build_stress_ng.log"
 
     # 并行度: 默认 = CPU 逻辑核心数, 可用 MAKE_JOBS 覆盖 (小内存机器可调小避免编译 OOM)
@@ -425,9 +427,36 @@ install_stress_ng_source() {
     log "    可选依赖: libaio/judy/sctp 等缺失仅禁用对应 stressor, 不影响 CPU/内存压测"
 
     tar -xzf "$tgz" -C "$build_dir" || { rm -rf "$build_dir"; return 1; }
-    local src_dir
-    src_dir=$(find "$build_dir" -maxdepth 1 -type d -name 'stress-ng-*' | head -1)
-    [ -n "$src_dir" ] || { rm -rf "$build_dir"; return 1; }
+
+    # ---- 定位解压出的源码目录 ----
+    # 顶层目录名不一定等于压缩包名 (个别包会去掉版本号或直接铺开), 统一按"存在 Makefile"判定
+    # 关键: -mindepth 1 不能省 —— find 会把起始目录本身按 depth 0 参与 -name 匹配,
+    #       少了它就会把 build_dir 自己当成源码目录, 进而在空目录里 make 而失败
+    local src_dir=""
+    if [ -f "${build_dir}/Makefile" ]; then
+        src_dir="$build_dir"          # 压缩包没有顶层目录, 文件直接铺开在根
+    else
+        src_dir=$(find "$build_dir" -mindepth 1 -maxdepth 1 -type d -name 'stress-ng*' 2>/dev/null | head -1)
+        if [ -z "$src_dir" ]; then
+            # 目录名前缀被改掉时, 仅当顶层只有一个子目录才采用它 (避免误判)
+            local subdirs sub_n
+            subdirs=$(find "$build_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+            sub_n=$(printf '%s\n' "$subdirs" | grep -c . 2>/dev/null || true)
+            if [ "${sub_n:-0}" = "1" ]; then
+                src_dir="$subdirs"
+            fi
+        fi
+    fi
+
+    if [ -z "$src_dir" ] || [ ! -f "${src_dir}/Makefile" ]; then
+        log "[WARN] 源码包解压后未找到 Makefile, 顶层内容如下:"
+        find "$build_dir" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's/^/        | /' | head -20
+        log "        请确认该文件是 stress-ng 源码包: ${tgz}"
+        rm -rf "$build_dir"
+        return 1
+    fi
+    log "    源码目录: ${src_dir}"
+    log "    构建步骤: cd ${src_dir} && make -j${jobs}"
 
     # 1) 多核编译 (日志落盘; if 条件内避免 set -e 直接中止)
     local rc=0
@@ -642,7 +671,8 @@ check_env() {
     log "CPU 型号: ${cpu_model}"
     log "CPU 逻辑核心: ${cores}"
     log "物理内存: ${mem_gb} GB"
-    log "压测将按系统实际资源动态满载: CPU ${cores} 核 / 内存约 $(( mem_gb - 4 )) GB (保留 4GB)"
+    # 与 stress_test.sh v2.2 的配额策略保持一致: MemTotal 的 90%, 且至少保留 8GB
+    log "压测将按系统实际资源动态满载: CPU ${cores} 核 / 内存约 $(( mem_gb * 9 / 10 )) GB (占 MemTotal 90%, 保留 >= 8GB)"
 
     # 兜底: 内存过小 (< 8GB) 时提醒, 避免 OOM 影响生产
     if [ "$mem_gb" -lt 8 ]; then

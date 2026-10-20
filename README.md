@@ -1,7 +1,7 @@
 # 系统满负载压测工具链（脚本 + 离线软件包 融合版）
 
 > 适用：任意 x86_64 服务器 / RHEL 8.x / Rocky Linux 8.x / AlmaLinux 8
-> 打包日期：2026-09-04
+> 打包日期：2026-09-04　|　最近更新：2026-10-20（v2.4 新增内存 ECC / EDAC 采集与判定）
 
 ---
 
@@ -11,7 +11,7 @@
 stress_test_full/
 ├── run_all.sh              # 一键主控：装依赖 → 环境检查 → 压测+监控 → 出报告
 ├── stress_test.sh          # 压测核心（stress-ng 优先，自动回退 GNU stress）
-├── monitor.sh              # 监控（每 10s 采集 CPU/内存/温度/功耗 → CSV）
+├── monitor.sh              # 监控（每 10s 采集 CPU/内存/温度/功耗/ECC 计数 → CSV）
 ├── generate_report.py      # 报告生成（纯标准库，输出 HTML 图表报告）
 ├── rpms/                   # 25 个离线 RPM（编译工具链 + 全部依赖，内网可用；stress-ng 仅作兜底）
 ├── src/
@@ -24,10 +24,14 @@ stress_test_full/
 ## 二、快速开始
 
 ```bash
-tar xzf stress_test_full.tar.gz
+tar xzf stress_test_full.tar.gz      # 解包后得到 stress_test_full/ 目录
 cd stress_test_full
 sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d 或秒数
 ```
+
+> 若拿到的是**旧版扁平包**（解包后脚本直接铺在当前目录，没有 `stress_test_full/`），
+> 不要 `cd stress_test_full`，直接 `sudo bash run_all.sh` 即可 ——
+> 脚本用自身所在路径定位 `rpms/` 与 `src/`，与解包位置无关。
 
 `run_all.sh` 启动时**自动先安装依赖**，安装策略如下：
 
@@ -196,7 +200,15 @@ python3 generate_report.py /var/log/stress_test/monitor_20260915_150556.csv repo
     --duration 86400      # 计划压测秒数（缺省时读 CSV 元数据 plan_duration_hours）
     --rc 1                # 压测退出码（0=正常跑满；非 0 标记"压测异常退出"）
     --note "备注结论，支持 \n 换行"   # 可选，渲染为报告顶部的"备注/结论"卡片
+    --stress-log stress_20260915_150556.log   # 可选，抽取 bogo ops / passed / failed 进报告
+    --base-freq 2450      # 可选，离线生成报告时指定基础频率(MHz)，用于降频判定
 ```
+
+报告端统计口径（v2.6 起）：默认**剔除首尾空载过渡样本**后计算 min/avg/max 与判定
+（压测启动前的空闲点、结束后的降温点）。采样点稀疏时（见 9.6）这两个点足以把
+平均值拉低 5~10 个百分点，把一次满载通过的压测误判成 "未达标"；图表仍画完整窗口，
+`--no-steady` 可恢复旧行为（不剔除）。被压测机上没装 python3 时，把 CSV 拷回
+办公机执行即可 —— 纯标准库，无第三方依赖。
 
 ---
 
@@ -229,6 +241,10 @@ sha256sum -c SHA256SUMS.txt   # 全部 OK 即文件完整
 - **强制重编译**：`FORCE_SOURCE=1 bash run_all.sh 24 -d`（已装 ≥0.20 也重新编译）
 - **失败自动降级**：`make -j$(nproc)` 失败 → 自动 `make clean && make -j1` 单核重试（排除并发 race / 编译期内存不足）
 - **日志落盘**：`/var/log/stress_test/build_stress_ng.log`；失败时终端打印尾部 25 行报错，源码目录保留供排查
+- **源码目录定位（v2.5 修复）**：解压到临时目录后按「含 `Makefile` 的顶层目录」识别源码根，
+  不依赖目录名与压缩包名一致；解压后找不到 `Makefile` 会打印顶层内容并明确报错，
+  不再静默回退 RPM。启动日志会打印 `源码目录: ...` 与 `构建步骤: cd ... && make -jN`，
+  可直接确认到底进了哪个目录。
 
 前置条件：`gcc` + `make`（**已含在 `rpms/` 离线包里，脚本会自动离线安装**）。若离线包缺失且系统无编译工具，脚本自动回退到 `rpms/` 里的 0.15.00 RPM。
 
@@ -297,3 +313,185 @@ gcc --version
 `dnf` 报 `nothing provides libJudy.so.1()(64bit)`，导致 0.15.00 RPM 装不上。
 **不影响**：只要 `gcc` + `make` 就位，脚本会走**源码编译 0.20.01**（默认路径），
 `libJudy` 属可选增强，缺失只禁用对应 stressor，CPU/内存满载压测不受影响。
+
+### 9.4 EDAC 计数全是 N/A（没采到 ECC）
+
+**现象**：`monitor.sh` 启动时打印 `[WARN] 未检测到 EDAC (...)`，报告里“内存无 CE / UE”显示 `未采集`。
+
+**原因**：内核未加载 EDAC 驱动，或该平台上 EDAC 只暴露在 `rasdaemon` 侧。
+
+**处理**：
+
+```bash
+ls /sys/devices/system/edac/mc/            # 空 = 未加载
+modprobe edac_mce_amd                      # AMD EPYC
+modprobe skx_edac                          # Intel Skylake-SP 及以后
+rasdaemon -r -d                            # 兜底：rasdaemon 记录机制
+ls /sys/devices/system/edac/mc/mc0/        # 应出现 ce_count / ue_count / dimm*
+```
+
+> 建议写入 `/etc/modules-load.d/edac.conf` 永久生效。
+> EDAC 不可用时脚本只降级为 N/A，其余指标采集与压测不受影响。
+
+### 9.5 源码包明明在，却装成了 RPM 0.15.00
+
+**现象**：`src/stress-ng-0.20.01.tar.gz` 存在、`gcc`/`make` 也在，但日志里出现
+`[WARN] stress-ng 编译失败` 后紧接着 `已安装 stress-ng 0.15.00 (离线 RPM 回退)`；
+`build_stress_ng.log` 内容只有一行 `### ... make -jN (源码: /tmp/stress-ng-build.xxxx)`，
+报错是 `make: *** No targets specified and no makefile found.  Stop.`
+
+**根因（v2.3 及更早）**：定位源码目录用的是
+`find "$build_dir" -maxdepth 1 -type d -name 'stress-ng-*' | head -1`，
+而构建目录本身由 `mktemp -d /tmp/stress-ng-build.XXXXXX` 创建，**目录名就匹配 `stress-ng-*`**。
+`find` 会把起始目录按 depth 0 参与匹配并**先**输出它，`head -1` 取到的就是空的构建目录，
+于是 `make` 在没有 Makefile 的目录里跑，必然失败并回退 RPM。
+
+**v2.5 修复**：`-mindepth 1` 排除起始目录；构建目录改名 `sng-build.XXXXXX`；
+源码根改为「含 `Makefile` 的顶层目录」判定；找不到 Makefile 时打印顶层内容并报错退出。
+
+**现场自证**（无需重装即可判断走的是哪条路）：
+
+```bash
+grep -n "源码目录\|构建步骤" /var/log/stress_test/build_stress_ng.log
+stress-ng --version                     # 期望 0.20.01；若为 0.15.00 说明走的 RPM 回退
+ls -d /tmp/stress-ng-build.* 2>/dev/null # v2.3 遗留的失败构建目录
+rpm -q stress-ng                        # 若装着 0.15.00 且 /usr/bin/stress-ng 是 0.20.01, 属正常覆盖
+```
+
+强制走源码重编译：
+
+```bash
+FORCE_SOURCE=1 sudo bash run_all.sh 24 -d
+```
+
+### 9.6 采样间隔从 10s 退化到 2 分钟以上（满负载下才出现）—— v2.6 已修复
+
+**现象**：CSV 实际采样间隔远大于配置的 10s（如 1 小时只有 20~30 个点），
+`monitor_console.log` 里两行输出相隔 2 分钟以上。**只在 CPU 满载时出现**，
+空载复测间隔正常。2026-10-20 在 R4950 G5 上实测：10s → 平均 139s，1 小时仅 27 个点。
+
+**根因**：`get_power()` 用 `ipmitool sensor` 拉取**全量传感器表**（双路机器数百项：
+128 个 Ecore 能量、全部 DIMM 温度、风扇等）。满负载下 BMC 的 KCS 接口与 OS 争抢 CPU，
+`ipmitool sensor` 从空载的 ~1s 退化到 1~2 分钟，整个采样循环被这一条命令拖住。
+
+**v2.6 修复**（`monitor.sh`，四个层次）：
+
+| 改动 | 作用 |
+|---|---|
+| 功耗改走 `ipmitool dcmi power reading` | 单次 IPMI 请求，毫秒级；DCMI 不支持才回退全量 `sensor` |
+| 每条采集命令加硬超时 `_tmo`（`CMD_TIMEOUT`，默认 10s，`-s KILL`） | 任何一条命令挂死都不再阻塞整轮 |
+| 采集方式缓存到 `$LOG_DIR/.power_method` | 探测只做一次；失败即降级 N/A，不再每轮重试 |
+| 每轮记录采集耗时，超阈值告警并指名慢环节 | 现场自证，不用再猜 |
+
+顺带修掉一个被间隔退化放大的统计错误：`cs_rate` 原来用固定 `INTERVAL` 做除数，
+间隔被拉长到 139s 时算出的 CS/s **虚高 14 倍**（实测把 1.8k 报成了 24.9k），
+现改为按相邻两个采样点的真实时间差计算。
+
+**验证方法**（跑起来看这三处）：
+
+```bash
+head -3 /var/log/stress_test/monitor_console.log
+# 期望: 功耗采集方式: ipmitool dcmi power reading (单次请求, 毫秒级)
+
+grep '采集耗时' /var/log/stress_test/monitor_console.log | head -3
+# 期望: 采集耗时: 十几~几十 ms (而不是 120000ms 级别)
+
+awk -F, 'NR>7{print $1-p; p=$1}' monitor_*.csv | sort -n | tail -1
+# 期望: 实际间隔 ≈ 配置的 10s
+```
+
+**老版本（v2.5 及之前）的临时规避**：`POWER_METHOD=none` 环境变量直接跳过功耗采集
+（CSV 功耗列记 N/A，其余指标照常），或手工把 `get_power()` 里的 `ipmitool sensor`
+换成 `ipmitool dcmi power reading`。若 `dcmi` 也不可用，用单点读取加超时：
+
+```bash
+ipmitool -N 2 -R 1 sensor get "PSU1 Pwr"
+```
+
+---
+
+## 十、内存 ECC（EDAC）采集与判定（v2.4 新增）
+
+### 10.1 为什么要把 ECC 纳入验收
+
+“24h 跑满、系统没挂”只证明**系统没有崩溃**，不证明**内存没有出错**。
+持续发生的 ECC 可纠正错误（CE）可以在不影响业务的前提下存在一整晚，
+一份判定“通过”的报告会把正在劣化的内存条判成好件，装回客户机器上继续用。
+
+典型现场：H3C R4950 G5（双路 EPYC 7763 + 2TB）在 24h 内存压测中，
+`CPU0 channel5（CFD1 槽位）`持续以约 13.5 CE/小时 的速度增长，而 CPU/内存利用率曲线
+全程漂亮、无 OOM、无宕机 —— 若只看利用率与温度，这台机器会被判“通过”。
+
+### 10.2 采集来源
+
+| 层级 | sysfs 路径 | 用途 |
+|---|---|---|
+| 控制器 | `mc/mc*/ce_count`、`mc*/ue_count` | 总量统计（CSV 主字段） |
+| DIMM | `mc*/dimm*/dimm_ce_count`、`dimm_ue_count`（新驱动） | 精确定位到具体内存条 |
+| 行/通道 | `mc*/csrow*/ce_count`（老驱动兜底） | 无 DIMM 视图时的替代定位 |
+
+新增 CSV 字段（追加在末尾，**向后兼容旧报告**）：
+
+| 字段 | 含义 |
+|---|---|
+| `edac_ce_total` | CE 累计计数（全控制器求和） |
+| `edac_ue_total` | UE 累计计数 |
+| `edac_ce_delta` | 本次采样新增 CE（首个采样点为 N/A） |
+| `edac_ue_delta` | 本次采样新增 UE |
+| `edac_loc` | 受影响位置摘要，按 CE 降序取前 3，如 `mc0/dimm3:1204;mc1/dimm5:16` |
+
+CSV 元数据同时写入 `# edac_available: 0/1` 与 `# edac_mc_count`，
+报告据此区分“**0 次错误**”与“**根本没采到**”——这两者在验收上天差地别，不能混为一谈。
+
+### 10.3 判定口径
+
+| 检查项 | 通过 | 告警 | 失败 |
+|---|---|---|---|
+| 内存无 UE（不可纠正） | 绝对计数 = 0 | — | 绝对计数 ≥ 1（含历史遗留） |
+| 内存无 CE（可纠正） | 本次新增 = 0 | 本次新增 ≥ 1 | — |
+
+- **UE 按绝对计数判失败**：UE 计数器自开机累计，压测窗口内读到 >0 就说明本机已发生过
+  不可纠正错误。即使本次 24h 无新增（历史遗留），数据完整性风险仍在，不判通过。
+- **CE 按增量判告警**：历史累计 CE 可能是几个月前遗留、已做过更换或隔离，不构成本次劣化；
+  “本轮只增不减”才是现行问题。绝对值仅作提示文案出现。
+- **未采集**：显示灰色 `未采集`，不判通过（不允许“没测”被当成“通过”）。
+
+报告中的呈现：KPI 卡片 `内存 CE / UE 累计`、独立曲线图 `内存 ECC 错误累计 (EDAC)`、
+关键指标汇总 4 行（CE/UE 累计与新增的 min/avg/max）、稳定性判定 2 行、以及
+`ECC 错误定位（EDAC）` 卡片（列出 CE 最集中的控制器/DIMM）。
+
+### 10.4 怎么读定位结果
+
+| 定位形态 | 优先怀疑 |
+|---|---|
+| CE 集中在单个 `dimm*` | 该条内存（直接替换复测） |
+| 分散在同一 `mc*` 的多个 DIMM | 该侧 CPU 的内存通道 / 插槽 |
+| 多个 `mc*` 同时持续增长 | 内存批次、散热或供电（VDIMM/PMIC） |
+| CE 与温度峰值在时间上同步 | 散热/风道问题，而非颗粒本身 |
+
+> 判定“CE 集中”要看**增量**而不是累计值：累计 1200 次但 24h 内增量为 0，说明是历史遗留、
+> 已被替换或隔离过，本次不算劣化；累计 0 但增量 800，才是本次压测抓到的现行问题。
+
+---
+
+## 十一、版本记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v2.0 | 2026-09-04 | 首个融合版：离线 RPM + 源码包 + 监控 + HTML 报告 |
+| v2.1 | 2026-09-16 | 修复长跑提前退出（内存配额改为 `min(MemTotal×PCT, MemAvailable-RESERVE)`）；新增自愈降配重试 |
+| v2.2 | 2026-09-16 | 依 hpc13 现场 OOM 证据把默认配额由 95% 下调至 90%，新增 OOM 预算核算与四档安全对比 |
+| v2.3 | 2026-09-22 | 同名 RPM 按「版本-发行号」判定是否跳过，修复 gcc 依赖永远无法满足；新增 `--note` 报告备注卡片 |
+| v2.4 | 2026-10-20 | 新增内存 ECC（EDAC）采集与报告判定（CE/UE 曲线、定位卡片、判定 2 行） |
+| v2.5 | 2026-10-20 | **修复源码安装目录定位 bug**：`mktemp` 构建目录名匹配 `stress-ng-*`，`find` 把起始目录自己当成源码目录 → 在空目录 `make` 失败 → 静默回退 RPM 0.15.00。改为 `-mindepth 1` + 按 `Makefile` 判定 + 明确报错；`SHA256SUMS.txt` 改为覆盖全部文件（含 rpms/src）并统一 LF |
+| v2.6 | 2026-10-20 | **修复采样间隔退化（10s → 139s）**：功耗改走 `ipmitool dcmi power reading`（单请求）+ 每条采集命令硬超时 `_tmo`（`-s KILL`）+ 采集方式落盘缓存 + 每轮采集耗时告警并指名慢环节。顺带修复 `cs_rate` 用固定 `INTERVAL` 做除数导致间隔退化时虚高 14 倍。报告端新增：稳态窗口统计（剔除首尾空载点，`--no-steady` 可关）、`--stress-log` 抽取 bogo ops / passed / failed 成卡片、`--base-freq` 及读不到基频时改判「无法判定」 |
+
+### v2.6 新增环境变量（monitor.sh）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CMD_TIMEOUT` | 10 | 单条采集命令硬超时（秒），超时即杀并降级 |
+| `POWER_METHOD` | auto | `auto` / `dcmi` / `sensor` / `none`，置 `none` 完全跳过功耗采集 |
+| `SLOW_WARN_MS` | 5000 | 单轮采集耗时告警阈值（毫秒） |
+| `INTERVAL` | 10 | 采样间隔（秒），仍是第 1 个位置参数 |
+
