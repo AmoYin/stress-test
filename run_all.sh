@@ -32,6 +32,22 @@ mkdir -p "$LOG_DIR"
 REPORT_DIR="${SCRIPT_DIR}/report"
 mkdir -p "$REPORT_DIR"
 
+#------------------------------- 网络安装限制 ---------------------------------
+# 无网络机器上 dnf 的默认行为: 每仓库元数据刷新 30s 超时 x 重试 10 次 x N 个仓库,
+# 一次 install 能挂几分钟到十几分钟。三层限制:
+#   1) net_available 连通性预探测 (纯 bash /dev/tcp, 不依赖 curl/wget),
+#      探测失败直接跳过全部在线尝试, 只走离线路径
+#   2) _dnf/_yum 包装: --setopt=timeout/retries 压缩单请求耗时,
+#      探测漏网的慢网/半死网络也不会长时间挂住
+#   3) OFFLINE_ONLY=1 显式声明纯内网, 连探测都跳过
+# 探测端口默认 443, 可用 NET_PROBE_PORT 覆盖 (便于测试)
+NET_PROBE_SEC="${NET_PROBE_SEC:-4}"        # 每个探测主机的连接超时 (秒)
+NET_PROBE_PORT="${NET_PROBE_PORT:-443}"    # 探测端口
+NET_TIMEOUT_SEC="${NET_TIMEOUT_SEC:-10}"   # dnf/yum 单请求超时 (秒)
+NET_RETRIES="${NET_RETRIES:-1}"            # dnf/yum 网络重试次数
+OFFLINE_ONLY="${OFFLINE_ONLY:-0}"          # 1 = 跳过一切在线尝试
+NET_PROBE_HOSTS="${NET_PROBE_HOSTS:-mirrors.aliyun.com mirrors.cloud.tencent.com mirrors.rockylinux.org}"
+
 # 后台守护模式相关路径
 DAEMON_LOG="${LOG_DIR}/run_all_daemon.log"
 DAEMON_PID_FILE="${LOG_DIR}/run_all.pid"
@@ -39,6 +55,50 @@ DAEMON_PID_FILE="${LOG_DIR}/run_all.pid"
 #------------------------------- 函数区 ---------------------------------------
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# 简易超时包装: -s KILL 保证挂死的连接一定被杀 (默认 TERM 对阻塞中的进程不一定生效)
+_to() {
+    local secs="$1"; shift
+    if command -v timeout &>/dev/null; then
+        timeout -s KILL "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+# 连通性探测: 任一探测主机 443 端口可建立 TCP 连接即视为在线
+# 返回 0=在线, 1=离线 (或 OFFLINE_ONLY=1)。全部失败最多耗时 3 x NET_PROBE_SEC
+net_available() {
+    [ "${OFFLINE_ONLY}" = "1" ] && return 1
+    local h
+    for h in ${NET_PROBE_HOSTS}; do
+        if _to "${NET_PROBE_SEC}" bash -c "exec 3<>/dev/tcp/${h}/${NET_PROBE_PORT}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# dnf/yum 包装: 附带单请求超时与重试限制
+# 注: 本地 RPM 安装也会先刷新元数据, 所以本地包安装同样要走这层包装
+_dnf() {
+    command -v dnf &>/dev/null || return 127
+    dnf --setopt=timeout="${NET_TIMEOUT_SEC}" --setopt=retries="${NET_RETRIES}" "$@"
+}
+_yum() {
+    command -v yum &>/dev/null || return 127
+    yum --setopt=timeout="${NET_TIMEOUT_SEC}" --setopt=retries="${NET_RETRIES}" "$@"
+}
+
+# 在线安装统一入口: 先探测, 离线直接放弃并说明原因
+# 用法: net_install <包名或URL>...   调用处按需接 || true
+net_install() {
+    if ! net_available; then
+        log "  [跳过在线] 网络不可用 (或 OFFLINE_ONLY=1), 放弃在线安装: $*"
+        return 1
+    fi
+    _dnf install -y "$@" || _yum install -y "$@"
 }
 
 #--------------------------- 参数解析与守护模式 --------------------------------
@@ -61,6 +121,10 @@ usage() {
   MAKE_JOBS=N         编译 stress-ng 的并行度, 默认 \$(nproc); 小内存机器可设 4
   FORCE_SOURCE=1      已装 stress-ng >= 0.20 也强制重新源码编译
   VM_MEM_PCT=90       压测内存占物理内存比例 (%)
+  OFFLINE_ONLY=1      已知纯内网: 跳过一切在线安装尝试与连通性探测
+  NET_PROBE_SEC=4     网络探测单主机连接超时 (秒), 探测失败即跳过在线安装
+  NET_TIMEOUT_SEC=10  dnf/yum 单请求超时 (秒), 避免无网络时刷元数据久挂
+  NET_RETRIES=1       dnf/yum 网络重试次数 (系统默认 10 次)
 
 示例:
   bash run_all.sh                交互输入时长, 需键入 y 确认
@@ -255,10 +319,17 @@ install_from_offline() {
     #            避免离线机仓库不可达/元数据过期时卡在刷新元数据后整批失败。
     local all_pkgs=("${rpms[@]}" "${dev_pkgs[@]}")
     if [ "${#all_pkgs[@]}" -gt 0 ]; then
+        local net_ok=0
+        if net_available; then
+            net_ok=1
+            log "网络探测通过, 允许在线仓库补依赖 (单请求超时 ${NET_TIMEOUT_SEC}s / 重试 ${NET_RETRIES} 次)"
+        else
+            log "网络探测失败 (或 OFFLINE_ONLY=1), 跳过在线补依赖, 直接纯本地安装"
+        fi
         if command -v dnf &>/dev/null; then
-            if dnf install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
-                log "依赖离线安装完成 (dnf)"
-            elif dnf install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
+            if [ "$net_ok" = "1" ] && _dnf install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (dnf, 在线补依赖)"
+            elif _dnf install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
                 log "依赖离线安装完成 (dnf 纯本地模式)"
             else
                 log "[WARN] dnf 安装未完全成功, 回退 rpm 逐个安装..."
@@ -272,9 +343,9 @@ install_from_offline() {
                 failed=1
             fi
         elif command -v yum &>/dev/null; then
-            if yum install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
-                log "依赖离线安装完成 (yum)"
-            elif yum install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
+            if [ "$net_ok" = "1" ] && _yum install -y "${all_pkgs[@]}" >"${pkg_log}" 2>&1; then
+                log "依赖离线安装完成 (yum, 在线补依赖)"
+            elif _yum install -y --disablerepo='*' "${all_pkgs[@]}" >>"${pkg_log}" 2>&1; then
                 log "依赖离线安装完成 (yum 纯本地模式)"
             else
                 log "[WARN] yum 安装未完全成功, 回退 rpm 逐个安装..."
@@ -521,8 +592,7 @@ ensure_toolchain() {
         done
     fi
     if ! command -v gcc &>/dev/null; then
-        dnf install -y gcc make >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 \
-            || yum install -y gcc make >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 || true
+        net_install gcc make >>"${LOG_DIR}/pkg_offline_install.log" 2>&1 || true
     fi
     command -v gcc &>/dev/null && command -v make &>/dev/null && return 0
     return 1
@@ -563,9 +633,10 @@ ensure_stress_ng() {
     fi
 
     # 3. 回退: 离线 RPM 0.15.00 (老版, 功能完整但部分新参数缺失)
+    #    注意: dnf/yum 安装本地 RPM 也会先刷在线元数据, 必须先探测网络
     if [ -f "$RPM_015" ]; then
-        if dnf install -y "$RPM_015" &>/dev/null \
-           || yum install -y "$RPM_015" &>/dev/null \
+        if { net_available && _dnf install -y "$RPM_015"; } &>/dev/null \
+           || { net_available && _yum install -y "$RPM_015"; } &>/dev/null \
            || rpm -Uvh --replacepkgs "$RPM_015" &>/dev/null; then
             log "已安装 stress-ng 0.15.00 (离线 RPM 回退)"
             return 0
@@ -579,15 +650,21 @@ ensure_stress_ng() {
     fi
 
     # 5. 在线兜底 (RHEL 8 默认仓库无 stress-ng, 需 EPEL)
+    if ! net_available; then
+        log "[ERROR] stress-ng / stress 安装失败 (网络不可用, 在线兜底不可达)!"
+        log "        离线处置: 确认 rpms/ 下有 gcc 工具链后用源码编译 0.20.01:"
+        log "          tar -xzf src/stress-ng-0.20.01.tar.gz && cd stress-ng-0.20.01 && make -j\$(nproc) && make install"
+        exit 1
+    fi
     log "安装 stress-ng ..."
-    if dnf install -y stress-ng &>/dev/null; then
+    if _dnf install -y stress-ng &>/dev/null; then
         return 0
     fi
     log "[提示] RHEL 8 官方仓库 (BaseOS/AppStream) 不含 stress-ng, 尝试安装 EPEL 仓库..."
-    if dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm &>/dev/null \
-       || dnf install -y https://mirrors.aliyun.com/epel/epel-release-latest-8.noarch.rpm &>/dev/null; then
+    if _dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm &>/dev/null \
+       || _dnf install -y https://mirrors.aliyun.com/epel/epel-release-latest-8.noarch.rpm &>/dev/null; then
         log "EPEL 仓库安装成功, 重试安装 stress-ng ..."
-        if dnf install -y stress-ng; then
+        if _dnf install -y stress-ng; then
             return 0
         fi
     fi
@@ -621,23 +698,24 @@ install_deps() {
     fi
 
     # 在线兜底: 离线装完仍缺失的, 走在线源 (编译工具链 gcc/make + 其余依赖)
+    # net_install 内部先做连通性探测, 离线时立即放弃, 不会卡在元数据刷新上
     if ! command -v gcc &>/dev/null; then
         log "安装 gcc (编译工具链)..."
-        dnf install -y gcc || yum install -y gcc || true
+        net_install gcc || true
     fi
     if ! command -v make &>/dev/null; then
         log "安装 make ..."
-        dnf install -y make || yum install -y make || true
+        net_install make || true
     fi
     ensure_stress_ng
     if ! command -v mpstat &>/dev/null; then
         log "安装 sysstat ..."
-        dnf install -y sysstat || yum install -y sysstat || true
+        net_install sysstat || true
     fi
     # 温度/功耗/序列号工具可选, 安装失败不阻断
-    command -v sensors &>/dev/null || { log "安装 lm_sensors ..."; dnf install -y lm_sensors || true; }
-    command -v ipmitool &>/dev/null || { log "安装 ipmitool ..."; dnf install -y ipmitool || true; }
-    command -v dmidecode &>/dev/null || { log "安装 dmidecode ..."; dnf install -y dmidecode || true; }
+    command -v sensors &>/dev/null || { log "安装 lm_sensors ..."; net_install lm_sensors || true; }
+    command -v ipmitool &>/dev/null || { log "安装 ipmitool ..."; net_install ipmitool || true; }
+    command -v dmidecode &>/dev/null || { log "安装 dmidecode ..."; net_install dmidecode || true; }
 
     if command -v stress-ng &>/dev/null; then
         log "压测引擎: $(stress-ng --version 2>/dev/null | head -1)"

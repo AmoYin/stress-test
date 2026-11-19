@@ -41,6 +41,14 @@ sudo bash run_all.sh          # 回车默认 24h，也可输入 12h / 30m / 2d �
 4. **在线兜底**：离线包缺失或安装失败 → 自动尝试在线源（RHEL 8 会先装 EPEL）
 
 > 无需任何手动装包步骤，内网/离线环境也能直接跑。
+>
+> **v2.7 起在线尝试自带网络限制**：启动时先做连通性探测（任一镜像 443 可达即视为在线），
+> 探测失败直接跳过所有在线 `dnf/yum` 尝试，只走离线路径，不再出现"无网络时刷元数据等几分钟"；
+> 探测通过的单请求也有 10s 超时 / 1 次重试上限。已知纯内网可显式声明，连探测都省掉：
+>
+> ```bash
+> sudo OFFLINE_ONLY=1 bash run_all.sh 24 -d
+> ```
 
 ---
 
@@ -485,6 +493,18 @@ CSV 元数据同时写入 `# edac_available: 0/1` 与 `# edac_mc_count`，
 | v2.4 | 2026-10-20 | 新增内存 ECC（EDAC）采集与报告判定（CE/UE 曲线、定位卡片、判定 2 行） |
 | v2.5 | 2026-10-20 | **修复源码安装目录定位 bug**：`mktemp` 构建目录名匹配 `stress-ng-*`，`find` 把起始目录自己当成源码目录 → 在空目录 `make` 失败 → 静默回退 RPM 0.15.00。改为 `-mindepth 1` + 按 `Makefile` 判定 + 明确报错；`SHA256SUMS.txt` 改为覆盖全部文件（含 rpms/src）并统一 LF |
 | v2.6 | 2026-10-20 | **修复采样间隔退化（10s → 139s）**：功耗改走 `ipmitool dcmi power reading`（单请求）+ 每条采集命令硬超时 `_tmo`（`-s KILL`）+ 采集方式落盘缓存 + 每轮采集耗时告警并指名慢环节。顺带修复 `cs_rate` 用固定 `INTERVAL` 做除数导致间隔退化时虚高 14 倍。报告端新增：稳态窗口统计（剔除首尾空载点，`--no-steady` 可关）、`--stress-log` 抽取 bogo ops / passed / failed 成卡片、`--base-freq` 及读不到基频时改判「无法判定」 |
+| v2.7 | 2026-11-19 | **无网络时在线安装等待过长的限制**：新增连通性预探测 `net_available()`（纯 bash `/dev/tcp`，不依赖 curl），探测失败直接跳过全部在线 `dnf/yum` 尝试；`_dnf`/`_yum` 包装统一附加 `--setopt=timeout/retries` 压缩单请求耗时；新增 `OFFLINE_ONLY=1` 显式纯内网开关。实测离线机 `install_from_offline` 全程从分钟级降至 ~3.5s |
+
+### v2.7 新增环境变量（run_all.sh，网络安装限制）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OFFLINE_ONLY` | 0 | 置 1 跳过一切在线安装尝试与连通性探测（已知纯内网时推荐） |
+| `NET_PROBE_SEC` | 4 | 连通性探测单主机连接超时（秒），探测失败即跳过在线安装 |
+| `NET_PROBE_HOSTS` | aliyun / 腾讯云 / rockylinux 镜像 | 探测主机列表，任一可达即视为在线 |
+| `NET_PROBE_PORT` | 443 | 探测端口（测试时可覆盖） |
+| `NET_TIMEOUT_SEC` | 10 | 交给 dnf/yum 的单请求超时（`--setopt=timeout`） |
+| `NET_RETRIES` | 1 | 交给 dnf/yum 的网络重试次数（系统默认 10） |
 
 ### v2.6 新增环境变量（monitor.sh）
 
